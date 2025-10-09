@@ -56,7 +56,7 @@ ProcessMessage SignalReplyModule::handleReceived(const meshtastic_MeshPacket &cu
         uint8_t hopsUsed = hopStart < hopLimit ? config.lora.hop_limit : hopStart - hopLimit;
         if (hopLimit != hopStart)
         {
-            snprintf(messageReply, sizeof(messageReply), "%s: indirect via %d nodes!", username, (hopsUsed));
+            snprintf(messageReply, sizeof(messageReply), "%s: odebrano poprzez %d wezly(ow), nie podam RSSI/SNR", username, (hopsUsed));
         }
         else
         {
