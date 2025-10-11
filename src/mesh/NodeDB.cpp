@@ -889,7 +889,7 @@ void NodeDB::installDefaultModuleConfig()
 #else
     moduleConfig.mqtt.enabled = false;
 #endif
-    moduleConfig.nodemodadmin.do_not_send_prv_over_mqtt = true;
+    moduleConfig.nodemodadmin.do_not_send_prv_over_mqtt = false;
     moduleConfig.nodemodadmin.sniffer_enabled = default_sniffer_enabled;
     moduleConfig.nodemodadmin.auto_responder_enabled = default_autoresponder_enabled;
     moduleConfig.nodemodadmin.auto_redirect_messages = default_autoredirect_messages_enabled;
@@ -908,7 +908,7 @@ void NodeDB::installDefaultModuleConfig()
 
     // opportunistic flooding defaults
     moduleConfig.has_nodemodadmin = true; // ensure presence
-    moduleConfig.nodemodadmin.opportunistic_flooding_enabled = true;
+    moduleConfig.nodemodadmin.opportunistic_flooding_enabled = false;
     moduleConfig.nodemodadmin.opportunistic_auto = true;
     moduleConfig.nodemodadmin.opportunistic_base_delay_ms = 120;
     moduleConfig.nodemodadmin.opportunistic_hop_delay_ms = 40;
@@ -917,7 +917,7 @@ void NodeDB::installDefaultModuleConfig()
     moduleConfig.nodemodadmin.opportunistic_cancel_on_first_hear = false; // disabled by default - sparse network safety
 
     // proactive traceroute defaults (FW+)
-    moduleConfig.nodemodadmin.proactive_traceroute_enabled = true;
+    moduleConfig.nodemodadmin.proactive_traceroute_enabled = false;
     moduleConfig.nodemodadmin.traceroute_stale_ratio_threshold_percent = 30; // percent
     moduleConfig.nodemodadmin.traceroute_global_cooldown_hours = 8;        // hours
     moduleConfig.nodemodadmin.traceroute_per_dest_cooldown_hours = 8;      // hours
@@ -927,9 +927,9 @@ void NodeDB::installDefaultModuleConfig()
     moduleConfig.nodemodadmin.traceroute_expanding_ring_max_hops = 3;
     moduleConfig.nodemodadmin.traceroute_probe_jitter_ms = 5000;            // ms
     // TTL override (0 means use firmware defaults)
-    moduleConfig.nodemodadmin.route_ttl_base_hours = 168;     // 3 days
-    moduleConfig.nodemodadmin.route_ttl_per_conf_hours = 24; // +1 day per confidence
-    moduleConfig.nodemodadmin.route_ttl_max_hours = 720;     // 30 days
+    moduleConfig.nodemodadmin.route_ttl_base_hours = 0;     // 3 days
+    moduleConfig.nodemodadmin.route_ttl_per_conf_hours = 0; // +1 day per confidence
+    moduleConfig.nodemodadmin.route_ttl_max_hours = 0;     // 30 days
 
     //fw+ removed HEARD/RAB defaults
     // Routing learning thresholds defaults (FW+)
@@ -977,7 +977,7 @@ void NodeDB::installDefaultModuleConfig()
     moduleConfig.broadcast_assist.jitter_ms = 400;
     moduleConfig.broadcast_assist.airtime_guard = true;
 
-    moduleConfig.has_ambient_lighting = true;
+    moduleConfig.has_ambient_lighting = false;
     moduleConfig.ambient_lighting.current = 10;
     // Default to a color based on our node number
     moduleConfig.ambient_lighting.red = (myNodeInfo.my_node_num & 0xFF0000) >> 16;
@@ -1487,7 +1487,7 @@ void NodeDB::loadFromDisk()
         }
 
         // 3) proactive traceroute defaults (fill unset only)
-        if (!moduleConfig.nodemodadmin.proactive_traceroute_enabled) { moduleConfig.nodemodadmin.proactive_traceroute_enabled = true; mutated = true; }
+        //if (!moduleConfig.nodemodadmin.proactive_traceroute_enabled) { moduleConfig.nodemodadmin.proactive_traceroute_enabled = true; mutated = true; }
         if (moduleConfig.nodemodadmin.traceroute_stale_ratio_threshold_percent == 0) { moduleConfig.nodemodadmin.traceroute_stale_ratio_threshold_percent = 30; mutated = true; }
         if (moduleConfig.nodemodadmin.traceroute_global_cooldown_hours == 0) { moduleConfig.nodemodadmin.traceroute_global_cooldown_hours = 12; mutated = true; }
         if (moduleConfig.nodemodadmin.traceroute_per_dest_cooldown_hours == 0) { moduleConfig.nodemodadmin.traceroute_per_dest_cooldown_hours = 12; mutated = true; }
@@ -1496,9 +1496,9 @@ void NodeDB::loadFromDisk()
         if (moduleConfig.nodemodadmin.traceroute_expanding_ring_initial_hop == 0) { moduleConfig.nodemodadmin.traceroute_expanding_ring_initial_hop = 1; mutated = true; }
         if (moduleConfig.nodemodadmin.traceroute_expanding_ring_max_hops == 0) { moduleConfig.nodemodadmin.traceroute_expanding_ring_max_hops = 3; mutated = true; }
         if (moduleConfig.nodemodadmin.traceroute_probe_jitter_ms == 0) { moduleConfig.nodemodadmin.traceroute_probe_jitter_ms = 5000; mutated = true; }
-        if (moduleConfig.nodemodadmin.route_ttl_base_hours == 0) { moduleConfig.nodemodadmin.route_ttl_base_hours = 72; mutated = true; }
-        if (moduleConfig.nodemodadmin.route_ttl_per_conf_hours == 0) { moduleConfig.nodemodadmin.route_ttl_per_conf_hours = 24; mutated = true; }
-        if (moduleConfig.nodemodadmin.route_ttl_max_hours == 0) { moduleConfig.nodemodadmin.route_ttl_max_hours = 720; mutated = true; }
+        //if (moduleConfig.nodemodadmin.route_ttl_base_hours == 0) { moduleConfig.nodemodadmin.route_ttl_base_hours = 72; mutated = true; }
+        //if (moduleConfig.nodemodadmin.route_ttl_per_conf_hours == 0) { moduleConfig.nodemodadmin.route_ttl_per_conf_hours = 24; mutated = true; }
+        //if (moduleConfig.nodemodadmin.route_ttl_max_hours == 0) { moduleConfig.nodemodadmin.route_ttl_max_hours = 720; mutated = true; }
 
         if (mutated) {
             saveToDisk(SEGMENT_MODULECONFIG);
