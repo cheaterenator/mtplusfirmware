@@ -8,6 +8,10 @@
 #include "mesh/generated/meshtastic/fwplus_dtn.pb.h"
 #include "mesh/generated/meshtastic/portnums.pb.h"
 #include <unordered_map>
+#include <map>
+#include <set>
+#include <vector>
+#include <string>
 
 class DtnOverlayModule : private concurrency::OSThread, public ProtobufModule<meshtastic_FwplusDtn>
 {
@@ -21,7 +25,8 @@ class DtnOverlayModule : private concurrency::OSThread, public ProtobufModule<me
     uint32_t getTtlMinutes() const { return configTtlMinutes; } //fw+
     // Enqueue overlay data created from a captured DM (plaintext or encrypted)
     // deadlineMs uses uint64_t to avoid overflow (epoch*1000 exceeds uint32 in 2025+)
-    void enqueueFromCaptured(uint32_t origId, uint32_t origFrom, uint32_t origTo, uint8_t channel,
+    // Returns: true if packet was enqueued, false if skipped (tombstone, queue full, too large)
+    bool enqueueFromCaptured(uint32_t origId, uint32_t origFrom, uint32_t origTo, uint8_t channel,
                              uint64_t deadlineMs, bool isEncrypted, const uint8_t *bytes, pb_size_t size,
                              bool allowProxyFallback);
     // Expose DTN stats snapshot for diagnostics
@@ -40,6 +45,12 @@ class DtnOverlayModule : private concurrency::OSThread, public ProtobufModule<me
         uint32_t lastForwardAgeSecs;
         uint32_t knownNodesCount; //fw+ number of known FW+ nodes
         bool enabled;
+        // Adaptive routing statistics
+        uint32_t adaptiveReroutes;
+        uint32_t linkHealthChecks;
+        uint32_t pathLearningUpdates;
+        uint32_t monitoredLinks;
+        uint32_t monitoredPaths;
     };
     // Fill snapshot with current counters
     void getStatsSnapshot(DtnStatsSnapshot &out) const;
@@ -63,25 +74,34 @@ class DtnOverlayModule : private concurrency::OSThread, public ProtobufModule<me
     
     // Check if DTN can help with specific destination - PUBLIC for Router access
     bool shouldInterceptLocalDM(NodeNum dest) const {
-        if (!configEnabled) return false;
+        if (!configEnabled) {
+            LOG_DEBUG("DTN intercept: disabled");
+            return false;
+        }
         
         // Never intercept broadcasts - DTN is for unicast only
         if (dest == NODENUM_BROADCAST || dest == NODENUM_BROADCAST_NO_LORA) {
+            LOG_DEBUG("DTN intercept: broadcast");
             return false;
         }
         
         // No DTN nodes known - use native DM immediately
         if (fwplusVersionByNode.empty()) {
+            LOG_DEBUG("DTN intercept: no FW+ nodes known");
             return false;
         }
         
         // Direct neighbor - native DM is faster, don't use DTN overlay
         if (isDirectNeighbor(dest)) {
+            LOG_INFO("DTN intercept SKIP: dest 0x%x is direct neighbor", (unsigned)dest);
             return false;
         }
         
         // Check if any known DTN node can help reach destination
-        return canDtnHelpWithDestination(dest);
+        bool canHelp = canDtnHelpWithDestination(dest);
+        LOG_INFO("DTN intercept: dest 0x%x canHelp=%d known_fwplus=%u", 
+                 (unsigned)dest, (int)canHelp, (unsigned)fwplusVersionByNode.size());
+        return canHelp;
     }
 
   protected:
@@ -198,7 +218,7 @@ class DtnOverlayModule : private concurrency::OSThread, public ProtobufModule<me
     // Post-warmup: if still no FW+ nodes known, continue searching
     uint32_t configAdvertiseIntervalUnknownMs = 120UL * 60UL * 1000UL; // 2h (post-warmup cold-start)
     // One-shot early advertise after enable/start
-    uint32_t configFirstAdvertiseDelayMs = 2UL * 60UL * 1000UL;        // 2min (wait for MQTT proxy connection)
+    uint32_t configFirstAdvertiseDelayMs = 2UL * 60UL * 1000UL;        // 2min base + 0-60s random jitter (prevents sync burst after power outage)
     uint32_t configFirstAdvertiseRetryMs = 10UL * 1000UL;              // 10s retry interval if first beacon fails
     uint32_t configFarMinTtlFracPercent = 20;      //fw+ reduced wait time for far nodes
     uint32_t configOriginProgressMinIntervalMs = 15000; // per-source min interval for milestone
@@ -211,7 +231,7 @@ class DtnOverlayModule : private concurrency::OSThread, public ProtobufModule<me
     bool configCaptureForeignText = false;          // capture of foreign TEXT DMs
     
     // Cold start handling
-    uint32_t configColdStartTimeoutMs = 30000;      //fw+ timeout before enabling native DM fallback
+    uint32_t configColdStartTimeoutMs = 30000;      //fw+ timeout before enabling native DM fallback (30s for testing)
     bool configColdStartNativeFallback = true;      //fw+ enable native DM when DTN is cold
     
     // Unresponsive FW+ destination fallback
@@ -250,6 +270,7 @@ class DtnOverlayModule : private concurrency::OSThread, public ProtobufModule<me
     uint32_t firstAdvertiseRetryMs = 0; //fw+ track retry attempts for first beacon
     uint8_t warmupBeaconsSent = 0; //fw+ track warmup beacons sent (staged discovery)
     uint32_t lastDetailedLogMs = 0;
+    // NOTE: immediateNeighborProbingDone removed - no longer using immediate probing
     // Hello-back unicast reply throttling
     bool configHelloBackEnabled = true;
     uint32_t configHelloBackMinIntervalMs = 60UL * 60UL * 1000UL; // per-origin min interval 1h (balanced for network efficiency)
@@ -355,6 +376,40 @@ class DtnOverlayModule : private concurrency::OSThread, public ProtobufModule<me
     uint8_t configTelemetryProbeMinRing = 2; // only probe if origin is >= 2 hops away
     uint32_t configTelemetryProbeCooldownMs = 2UL * 60UL * 60UL * 1000UL; // per-origin cooldown 2h
     std::unordered_map<NodeNum, uint32_t> lastTelemetryProbeToNodeMs;
+    
+    // NOTE: Aggressive discovery removed - rely exclusively on passive broadcast beacons
+    
+    // CRITICAL: Global probe rate limiter to prevent bursts
+    // Ensures MINIMUM 90 seconds between ANY probes (not just per-node)
+    uint32_t lastGlobalProbeMs = 0;
+    uint32_t configGlobalProbeMinIntervalMs = 90000; // Absolute minimum 90s between probes
+    uint32_t configMaxNodeAgeSec = 24UL * 60UL * 60UL; // Only probe nodes seen within 24h (not dead nodes)
+    
+    // NOTE: Immediate neighbor probing removed - rely exclusively on passive broadcast beacons
+    
+    // CRITICAL: Global probe rate limiter helpers
+    bool isGlobalProbeCooldownActive() const {
+        if (lastGlobalProbeMs == 0) return false;
+        uint32_t nowMs = millis();
+        return (nowMs > lastGlobalProbeMs) && ((nowMs - lastGlobalProbeMs) < configGlobalProbeMinIntervalMs);
+    }
+    
+    void updateGlobalProbeTimestamp() {
+        lastGlobalProbeMs = millis();
+    }
+    
+    uint32_t getGlobalProbeCooldownRemainingSec() const {
+        if (!isGlobalProbeCooldownActive()) return 0;
+        uint32_t nowMs = millis();
+        uint32_t elapsedMs = nowMs - lastGlobalProbeMs;
+        return (configGlobalProbeMinIntervalMs - elapsedMs) / 1000;
+    }
+    
+    // Check if node is "alive" (seen recently via last_heard)
+    bool isNodeAlive(NodeNum node) const;
+    
+    // Get node age in seconds (time since last_heard)
+    uint32_t getNodeAgeSec(NodeNum node) const;
 
     // Simple FNV-1a 32-bit
     static uint32_t fnv1a32(uint32_t x) {
@@ -381,8 +436,7 @@ class DtnOverlayModule : private concurrency::OSThread, public ProtobufModule<me
     // OnDemand response observation for DTN discovery
     void observeOnDemandResponse(const meshtastic_MeshPacket &mp);
     
-    // Cold start aggressive discovery
-    void triggerAggressiveDiscovery();
+    // NOTE: Aggressive discovery removed - rely exclusively on passive broadcast beacons
     
     // Check if DTN nodes can help reach destination (proximity analysis)
     bool canDtnHelpWithDestination(NodeNum dest) const;
@@ -417,6 +471,157 @@ class DtnOverlayModule : private concurrency::OSThread, public ProtobufModule<me
     void processMilestoneEmission(const meshtastic_MeshPacket &mp, const meshtastic_FwplusDtnData &data);
     bool processForeignDMCapture(const meshtastic_MeshPacket &mp);
     void processTelemetryProbe(const meshtastic_MeshPacket &mp);
+
+    //==============================================================================
+    // ADAPTIVE PATH SELECTION & FAULT TOLERANCE
+    //==============================================================================
+
+    // Purpose: Track health metrics for a specific neighbor link
+    // Used to: Make intelligent routing decisions and avoid problematic links
+    struct LinkHealth {
+        NodeNum neighbor;                 // Neighbor node ID
+        uint32_t successCount;            // Total successful transmissions
+        uint32_t failureCount;            // Total failed transmissions
+        uint8_t consecutiveFailures;      // Current streak of failures (reset on success)
+        float avgSnr;                     // Average SNR (Exponentially Weighted Moving Average)
+        float avgRssi;                    // Average RSSI (EWMA)
+        uint32_t lastSuccessMs;           // Timestamp of last successful transmission
+        uint32_t lastFailureMs;           // Timestamp of last failure
+        uint32_t lastHealthCheckMs;       // Last time health was evaluated
+        
+        LinkHealth() : neighbor(0), successCount(0), failureCount(0), 
+                       consecutiveFailures(0), avgSnr(0.0f), avgRssi(0.0f),
+                       lastSuccessMs(0), lastFailureMs(0), lastHealthCheckMs(0) {}
+    };
+
+    // Purpose: Track reliability of a specific path (source -> intermediate -> destination)
+    // Used to: Learn from failures and avoid problematic routes for future packets
+    struct PathReliability {
+        NodeNum firstHop;                 // First hop of this path
+        NodeNum destination;              // Final destination
+        uint32_t successCount;            // Packets successfully delivered via this path
+        uint32_t failureCount;            // Packets that failed via this path
+        uint32_t lastAttemptMs;           // Last time we tried this path
+        uint32_t lastSuccessMs;           // Last successful delivery
+        uint32_t lastFailureMs;           // Last failure
+        bool temporarilyBlocked;          // Is this path currently blocked?
+        uint32_t blockExpiryMs;           // When to unblock this path (0 = not blocked)
+        
+        PathReliability() : firstHop(0), destination(0), successCount(0), failureCount(0),
+                            lastAttemptMs(0), lastSuccessMs(0), lastFailureMs(0),
+                            temporarilyBlocked(false), blockExpiryMs(0) {}
+        
+        // Calculate success rate (0.0 to 1.0)
+        float getSuccessRate() const {
+            uint32_t total = successCount + failureCount;
+            return (total > 0) ? (float)successCount / total : 0.5f; // Unknown = neutral
+        }
+        
+        // Check if path should be avoided
+        bool isUnreliable() const {
+            if (temporarilyBlocked && millis() < blockExpiryMs) {
+                return true; // Blocked until expiry
+            }
+            
+            // Consider unreliable if:
+            // - More than 3 consecutive failures
+            // - Success rate below 40%
+            // - No success in last 5 minutes despite attempts
+            bool tooManyFailures = (failureCount > 3 && getSuccessRate() < 0.4f);
+            bool staleFailures = (lastFailureMs > lastSuccessMs && 
+                                  (millis() - lastSuccessMs) > 300000 &&
+                                  failureCount > 0);
+            
+            return tooManyFailures || staleFailures;
+        }
+    };
+
+    // Purpose: Track which paths were attempted for a specific packet
+    // Used to: Avoid retrying same failed path and enable learning
+    struct PacketPathHistory {
+        PacketId packetId;                    // Original packet ID
+        NodeNum destination;                  // Destination of this packet
+        std::vector<NodeNum> attemptedHops;   // First hops we tried
+        uint8_t pathSwitchCount;              // How many times we switched paths
+        uint32_t firstAttemptMs;              // When we first tried
+        uint32_t lastAttemptMs;               // Last attempt timestamp
+        
+        PacketPathHistory() : packetId(0), destination(0), pathSwitchCount(0),
+                              firstAttemptMs(0), lastAttemptMs(0) {}
+        
+        // Check if we already tried this first hop
+        bool hasAttempted(NodeNum hop) const {
+            return std::find(attemptedHops.begin(), attemptedHops.end(), hop) 
+                   != attemptedHops.end();
+        }
+        
+        // Record a new attempt
+        void recordAttempt(NodeNum hop) {
+            if (!hasAttempted(hop)) {
+                attemptedHops.push_back(hop);
+                pathSwitchCount++;
+            }
+            lastAttemptMs = millis();
+            if (firstAttemptMs == 0) firstAttemptMs = millis();
+        }
+    };
+
+    // Helper struct for path candidates
+    struct PathCandidate {
+        NodeNum nextHop;
+        uint8_t hopCount;
+        float cost;
+        float score;
+        
+        PathCandidate() : nextHop(0), hopCount(255), cost(999.0f), score(0.0f) {}
+    };
+
+    // Link health monitoring functions
+    void updateLinkHealth(NodeNum neighbor, bool success, float snr, float rssi);
+    bool isLinkHealthy(NodeNum neighbor) const;
+    float getLinkQualityScore(NodeNum neighbor) const;
+    void maintainLinkHealth();
+
+    // Path reliability learning functions
+    void recordPathAttempt(NodeNum firstHop, NodeNum destination, PacketId packetId);
+    void updatePathReliability(NodeNum firstHop, NodeNum destination, bool success);
+    bool isPathReliable(NodeNum firstHop, NodeNum destination) const;
+    std::set<NodeNum> getUnreliablePaths(NodeNum destination) const;
+    void maintainPathReliability();
+
+    // Adaptive path selection functions
+    NodeNum selectAlternativePathOnFailure(uint32_t id, Pending &p, NodeNum failedHop = 0);
+    float calculatePathScore(NodeNum firstHop, NodeNum dest, float cost, uint8_t hops) const;
+
+    // Maintenance functions
+    void runPeriodicMaintenance();
+    void logAdaptiveRoutingStatistics();
+    std::string formatHopList(const std::vector<NodeNum>& hops) const;
+
+    // Link health monitoring
+    std::map<NodeNum, LinkHealth> linkHealthMap;
+    uint32_t linkHealthUpdateIntervalMs = 30000;  // Update health every 30s
+    
+    // Path reliability learning
+    std::map<std::pair<NodeNum, NodeNum>, PathReliability> pathReliabilityMap;
+    
+    // Per-packet path tracking
+    std::map<PacketId, PacketPathHistory> packetPathHistoryMap;
+    
+    // Configuration
+    bool configEnableAdaptiveRerouting = true;
+    uint8_t configMaxPathSwitches = 2;           // Max reroute attempts per packet
+    uint8_t configLinkFailureThreshold = 3;      // Consecutive fails to mark link bad
+    uint32_t configLinkHealthWindowMs = 300000;  // 5min window for health calc
+    uint32_t configPathBlockDurationMs = 600000; // 10min path block on failure
+    float configMinLinkSnrThreshold = 3.0f;      // Minimum acceptable SNR
+    float configMinPathSuccessRate = 0.3f;       // Minimum acceptable path success rate
+    
+    // Statistics
+    uint32_t ctrAdaptiveReroutes = 0;            // Counter: adaptive path switches
+    uint32_t ctrLinkHealthChecks = 0;            // Counter: link health evaluations
+    uint32_t ctrPathLearningUpdates = 0;         // Counter: path reliability updates
+    uint32_t lastMaintenanceMs = 0;              // Last maintenance timestamp
 };
 
 extern DtnOverlayModule *dtnOverlayModule; //fw+

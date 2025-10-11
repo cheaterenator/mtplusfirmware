@@ -346,7 +346,10 @@ ErrorCode Router::send(meshtastic_MeshPacket *p)
 
     // Up until this point we might have been using 0 for the from address (if it started with the phone), but when we send over
     // the lora we need to make sure we have replaced it with our local address
-    p->from = getFrom(p);
+    //fw+ CRITICAL: Don't overwrite if from is already set (e.g., DTN fallback with spoofed sender for decryption)
+    if (p->from == 0) {
+        p->from = getFrom(p);
+    }
 
     p->relay_node = nodeDB->getLastByteOfNodeNum(getNodeNum()); // set the relayer to us
     // fw+ sniffer: forward our own TX to phone (originator only), but not for broadcasts (broadcasts są dostarczane lokalnie)
@@ -375,19 +378,28 @@ ErrorCode Router::send(meshtastic_MeshPacket *p)
     if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag) {
         //fw+ DTN-first: intercept private TEXT unicasts when DTN overlay is enabled and can help
 #if __has_include("mesh/generated/meshtastic/fwplus_dtn.pb.h")
-        if (dtnOverlayModule && dtnOverlayModule->shouldInterceptLocalDM(p->to) &&
+        // CRITICAL: Don't re-intercept DTN fallback packets (spoofed sender = from != our node)
+        // DTN fallback uses sender spoofing for proper decryption, but this would create infinite loop
+        // if we intercept again: DTN fallback → Router intercept → DTN → fallback → ...
+        bool isDtnFallback = (p->from != 0 && p->from != getNodeNum());
+        
+        if (dtnOverlayModule && !isDtnFallback && dtnOverlayModule->shouldInterceptLocalDM(p->to) &&
             p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP && !isBroadcast(p->to)) {
             uint32_t ttlMinutes = dtnOverlayModule->getTtlMinutes();
             //fw+ Fix overflow: use 64-bit arithmetic for deadline calculation
             uint64_t nowSec = getValidTime(RTCQualityFromNet);
             uint64_t deadline = (nowSec * 1000ULL) + (ttlMinutes * 60ULL * 1000ULL);
             //fw+ enqueue plaintext payload for DTN; allow proxy fallback later
-            dtnOverlayModule->enqueueFromCaptured(p->id, getFrom(p), p->to, p->channel, deadline,
-                                                  false, p->decoded.payload.bytes, p->decoded.payload.size, true);
-            //fw+ Don't send ACK here - let DTN module handle ACK after actual delivery
-            // This prevents "queued" status in Android app - DTN will send proper ACK after delivery
-            packetPool.release(p);
-            return meshtastic_Routing_Error_NONE;
+            bool enqueued = dtnOverlayModule->enqueueFromCaptured(p->id, getFrom(p), p->to, p->channel, deadline,
+                                                                  false, p->decoded.payload.bytes, p->decoded.payload.size, true);
+            if (enqueued) {
+                //fw+ Don't send ACK here - let DTN module handle ACK after actual delivery
+                // This prevents "queued" status in Android app - DTN will send proper ACK after delivery
+                packetPool.release(p);
+                return meshtastic_Routing_Error_NONE;
+            }
+            // else: Packet was skipped (tombstone/queue full) - continue with normal routing
+            LOG_DEBUG("DTN: Packet id=0x%x skipped by DTN (tombstone/queue full) - using normal routing", p->id);
         }
 #endif
         ChannelIndex chIndex = p->channel; // keep as a local because we are about to change it
