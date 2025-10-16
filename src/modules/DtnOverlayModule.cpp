@@ -232,6 +232,10 @@ void DtnOverlayModule::getStatsSnapshot(DtnStatsSnapshot &out) const
     out.pathLearningUpdates = ctrPathLearningUpdates;
     out.monitoredLinks = linkHealthMap.size();
     out.monitoredPaths = pathReliabilityMap.size();
+    
+    // Progressive relay statistics
+    out.progressiveRelays = ctrProgressiveRelays;
+    out.progressiveRelayLoops = ctrProgressiveRelayLoops;
 }
 
 // Purpose: initialize DTN overlay module with conservative defaults and read ModuleConfig.
@@ -496,6 +500,9 @@ bool DtnOverlayModule::checkAndSuppressDuplicateNativeText(const meshtastic_Mesh
 // Effect: emits sparse PROGRESSED receipts with rate limiting and topology-based filtering
 void DtnOverlayModule::processMilestoneEmission(const meshtastic_MeshPacket &mp, const meshtastic_FwplusDtnData &data)
 {
+    // Guard: don't emit milestones if DTN is disabled (don't advertise as FW+ capable)
+    if (!configEnabled) return;
+    
     // CRITICAL: Global milestone rate limit to prevent burst (watchdog protection)
     // Even with per-source limits, multiple sources can create burst
     static uint32_t lastGlobalMilestoneMs = 0;
@@ -731,15 +738,36 @@ bool DtnOverlayModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, m
     
     // Handle DTN DATA packets
     if (msg && msg->which_variant == meshtastic_FwplusDtn_data_tag) {
-        // Mark sender as FW+ capable
-        markFwplusSeen(getFrom(&mp));
-        
         // Check if this is a broadcast or unicast
         bool isBroadcast = (mp.to == NODENUM_BROADCAST || mp.to == NODENUM_BROADCAST_NO_LORA);
         bool isForUs = (mp.to == nodeDB->getNodeNum());
         
         // Check if the DATA payload is destined for us
         bool dataDestIsUs = (msg->variant.data.orig_to == nodeDB->getNodeNum());
+        
+        // CRITICAL: If DTN is disabled, reject intermediate custody but ALWAYS deliver if we're destination
+        // This prevents "black hole" where disabled node is discovered as FW+ but never forwards
+        if (!configEnabled) {
+            if (dataDestIsUs) {
+                // We are the final destination - ALWAYS deliver even if DTN disabled
+                LOG_INFO("DTN rx DATA id=0x%x (DESTINATION) - delivering locally (DTN disabled)", 
+                         msg->variant.data.orig_id);
+                deliverLocal(msg->variant.data);
+                
+                // Send native ACK for app UX (but NO DTN RECEIPT - we're not advertising DTN capability)
+                routingModule->sendAckNak(meshtastic_Routing_Error_NONE, msg->variant.data.orig_from, 
+                                         msg->variant.data.orig_id, msg->variant.data.channel, 0);
+                return true; // Consume packet
+            } else {
+                // Intermediate custody - REJECT (DTN disabled, don't advertise as relay)
+                LOG_INFO("DTN rx DATA id=0x%x - DTN disabled, rejecting intermediate custody (dest=0x%x)", 
+                         msg->variant.data.orig_id, (unsigned)msg->variant.data.orig_to);
+                return false; // Let Router handle as normal packet (will relay or drop)
+            }
+        }
+        
+        // DTN enabled - mark sender as FW+ capable and process normally
+        markFwplusSeen(getFrom(&mp));
         
         LOG_INFO("DTN rx DATA id=0x%x from=0x%x to=0x%x (mp.to=0x%x) enc=%d dl=%u", msg->variant.data.orig_id,
                  (unsigned)getFrom(&mp), (unsigned)msg->variant.data.orig_to, (unsigned)mp.to,
@@ -767,11 +795,43 @@ bool DtnOverlayModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, m
     
     // Handle DTN RECEIPT packets
     if (msg && msg->which_variant == meshtastic_FwplusDtn_receipt_tag) {
-        markFwplusSeen(getFrom(&mp));
-        
         // Check if this packet is FOR US or is a broadcast (beacon)
         bool isForUs = (mp.to == nodeDB->getNodeNum());
         bool isBroadcast = (mp.to == NODENUM_BROADCAST || mp.to == NODENUM_BROADCAST_NO_LORA);
+        
+        // CRITICAL: If DTN is disabled, we still observe other FW+ nodes (passive discovery)
+        // but we DON'T advertise ourselves as FW+ capable (skip markFwplusSeen for self)
+        // We DO process RECEIPTs for us (delivery confirmations) even if disabled
+        if (!configEnabled) {
+            if (isForUs) {
+                // RECEIPT for us - process even if DTN disabled (e.g., reply to probe we sent before disabling)
+                LOG_INFO("DTN rx RECEIPT id=0x%x status=%u from=0x%x (FOR US, DTN disabled)", 
+                         msg->variant.receipt.orig_id, (unsigned)msg->variant.receipt.status, (unsigned)getFrom(&mp));
+                // Observe sender's FW+ capability (passive learning)
+                if (msg->variant.receipt.reason > 0) {
+                    NodeNum origin = getFrom(&mp);
+                    uint16_t ver = (uint16_t)(msg->variant.receipt.reason & 0xFFFFu);
+                    recordFwplusVersion(origin, ver);
+                }
+                // Don't call handleReceipt() - we have no pending DTN packets when disabled
+                return true; // Consume - this is for us
+            } else {
+                // Broadcast or transit RECEIPT - observe but don't mark ourselves as FW+
+                if (isBroadcast || msg->variant.receipt.reason > 0) {
+                    NodeNum origin = getFrom(&mp);
+                    uint16_t ver = (uint16_t)(msg->variant.receipt.reason & 0xFFFFu);
+                    if (ver > 0) {
+                        LOG_DEBUG("DTN: Passive discovery - node 0x%x is FW+ v%u (DTN disabled)", 
+                                 (unsigned)origin, (unsigned)ver);
+                        recordFwplusVersion(origin, ver);
+                    }
+                }
+                return false; // Don't consume - let it propagate/relay
+            }
+        }
+        
+        // DTN enabled - mark sender as FW+ capable and process normally
+        markFwplusSeen(getFrom(&mp));
         
         if (isBroadcast) {
             // Broadcast RECEIPT (beacon) - process for discovery but DON'T consume (let it propagate)
@@ -1087,7 +1147,8 @@ void DtnOverlayModule::handleReceipt(const meshtastic_MeshPacket &mp, const mesh
                             emitReceipt(origin, 0, meshtastic_FwplusDtnStatus_FWPLUS_DTN_STATUS_PROGRESSED, reason);
                             lastHelloBackToNodeMs[origin] = nowMs;
                             updateGlobalProbeTimestamp();
-                            LOG_INFO("DTN: Immediate hello-back sent to new FW+ node 0x%x", (unsigned)origin);
+                            LOG_INFO("DTN: Immediate hello-back sent to new FW+ node 0x%x (discovered FW+ nodes: %u)", 
+                                     (unsigned)origin, (unsigned)fwplusVersionByNode.size());
                         }
                     }
                 }
@@ -1123,7 +1184,8 @@ void DtnOverlayModule::handleReceipt(const meshtastic_MeshPacket &mp, const mesh
                             emitReceipt(origin, 0, meshtastic_FwplusDtnStatus_FWPLUS_DTN_STATUS_PROGRESSED, reason);
                             lastHelloBackToNodeMs[origin] = nowMs;
                             updateGlobalProbeTimestamp();
-                            LOG_INFO("DTN: Hello-back sent to origin=0x%x", (unsigned)origin);
+                            LOG_INFO("DTN: Hello-back sent to origin=0x%x (discovered FW+ nodes: %u)", 
+                                     (unsigned)origin, (unsigned)fwplusVersionByNode.size());
                         } else {
                             LOG_DEBUG("DTN: Channel busy, hello-back blocked");
                         }
@@ -1291,18 +1353,50 @@ void DtnOverlayModule::tryForward(uint32_t id, Pending &p)
                  (unsigned)p.data.orig_to, (unsigned)p.tries);
     }
     
-    // CRITICAL: No routing confidence fallback for source node
-    // DTN custody requires routing hints to avoid wrong-direction handoff.
-    // Without routing confidence, we CANNOT reliably choose handoff target.
-    // Strategy: Use native DM fallback for reliability (mesh routing handles it).
-    // Note: We do NOT assume routing will "warm up" - in large/sparse meshes (200 nodes, 300km)
-    //       ACKs may never return, and routing may remain empty for hours or days.
-    if (lowConf && isFromSource && p.data.allow_proxy_fallback) {
-        LOG_WARN("DTN: No routing confidence to dest 0x%x - using native DM fallback (uptime=%us)",
-                 (unsigned)p.data.orig_to, (unsigned)((millis() - moduleStartMs) / 1000));
-        if (sendProxyFallback(id, p)) {
-            ctrFallbacksAttempted++;
-            return; // Fallback sent successfully
+    // CRITICAL DECISION POINT: Progressive Relay vs Native Fallback
+    // For source nodes without routing confidence, we have two strategies:
+    // 1. Progressive Relay: Use DTN custody transfer to edge nodes (for unknown/distant destinations)
+    // 2. Native DM Fallback: Use stock Meshtastic routing (for known but low-confidence routes)
+    //
+    // Progressive relay should be tried FIRST for unknown/distant destinations,
+    // as it can reach beyond hop_limit=7 constraint via multi-hop DTN custody chain.
+    bool useProgressiveRelay = false;
+    
+    if (lowConf && isFromSource) {
+        uint8_t hopsToDest = getHopsAway(p.data.orig_to);
+        
+        // Try progressive relay for unknown (hops=255) or very distant (hops>HOP_MAX) destinations
+        if (hopsToDest == 255 || hopsToDest > HOP_MAX) {
+            NodeNum edgeNode = chooseProgressiveRelay(p.data.orig_to, p);
+            
+            if (edgeNode != 0) {
+                // SUCCESS: Progressive relay available
+                // Continue to DTN forwarding below (selectForwardTarget will use progressive relay)
+                useProgressiveRelay = true;
+                LOG_INFO("DTN: Progressive relay available to edge 0x%x (dest 0x%x hops=%u) - using DTN custody",
+                         (unsigned)edgeNode, (unsigned)p.data.orig_to, hopsToDest);
+            } else {
+                // NO EDGE NODES: Try fallback as last resort
+                if (p.data.allow_proxy_fallback) {
+                    LOG_WARN("DTN: No progressive relay available for dest 0x%x (hops=%u) - trying native fallback",
+                             (unsigned)p.data.orig_to, hopsToDest);
+                    if (sendProxyFallback(id, p)) {
+                        ctrFallbacksAttempted++;
+                        return; // Fallback sent successfully
+                    }
+                }
+            }
+        } else {
+            // Known route (hops < 255 and <= HOP_MAX) but low confidence
+            // Use native fallback for these cases (better than guessing DTN path)
+            if (p.data.allow_proxy_fallback) {
+                LOG_WARN("DTN: Known route but low confidence to dest 0x%x (hops=%u) - using native fallback",
+                         (unsigned)p.data.orig_to, hopsToDest);
+                if (sendProxyFallback(id, p)) {
+                    ctrFallbacksAttempted++;
+                    return; // Fallback sent successfully
+                }
+            }
         }
     }
     
@@ -1630,6 +1724,9 @@ void DtnOverlayModule::maybeTriggerTraceroute(NodeNum dest)
 // Notes: uses BACKGROUND priority and avoids ACKs; reason carries optional telemetry (e.g., FW+ version advertise).
 void DtnOverlayModule::emitReceipt(uint32_t to, uint32_t origId, meshtastic_FwplusDtnStatus status, uint32_t reason)
 {
+    // Guard: don't emit receipts if DTN is disabled (don't advertise as FW+ capable)
+    if (!configEnabled) return;
+    
     meshtastic_FwplusDtn msg = meshtastic_FwplusDtn_init_zero;
     msg.which_variant = meshtastic_FwplusDtn_receipt_tag;
     msg.variant.receipt.orig_id = origId;
@@ -1681,16 +1778,23 @@ bool DtnOverlayModule::shouldEmitMilestone(NodeNum src, NodeNum dst)
 }
 void DtnOverlayModule::recordFwplusVersion(NodeNum n, uint16_t version)
 {
+    bool wasNew = (fwplusVersionByNode.find(n) == fwplusVersionByNode.end());
     fwplusVersionByNode[n] = version;
     markFwplusSeen(n);
+    
+    // Log total discovered FW+ nodes count for visibility
+    if (wasNew) {
+        LOG_INFO("DTN: Discovered new FW+ node 0x%x ver=%u (total FW+ nodes: %u)", 
+                 (unsigned)n, (unsigned)version, (unsigned)fwplusVersionByNode.size());
+    }
     
     //Clear stock marking when we receive FW+ version advertisement
     // This handles the case where a node had DTN disabled (was marked as stock via unresponsive fallback),
     // but later enabled DTN and started sending beacons again
     auto itStock = stockKnownMs.find(n);
     if (itStock != stockKnownMs.end()) {
-        LOG_INFO("DTN: Clearing stock marking for node 0x%x (received FW+ version %u beacon)",
-                 (unsigned)n, (unsigned)version);
+        LOG_INFO("DTN: Clearing stock marking for node 0x%x (received FW+ version %u beacon, total FW+ nodes: %u)",
+                 (unsigned)n, (unsigned)version, (unsigned)fwplusVersionByNode.size());
         stockKnownMs.erase(itStock);
     }
 }
@@ -2033,6 +2137,9 @@ void DtnOverlayModule::logDetailedStats()
     LOG_INFO("DTN Enhanced: handoffs=%u cache_hits=%u loops=%u delivered=%u duplicates=%u",
               (unsigned)ctrHandoffsAttempted, (unsigned)ctrHandoffCacheHits, (unsigned)ctrLoopsDetected,
               (unsigned)ctrDeliveredLocal, (unsigned)ctrDuplicatesSuppressed);
+    
+    LOG_INFO("DTN Progressive Relay: relays=%u relay_loops_prevented=%u",
+              (unsigned)ctrProgressiveRelays, (unsigned)ctrProgressiveRelayLoops);
 
     LOG_INFO("DTN FW+ Discovery: %u known nodes, cold_start=%s, last_beacon=%u sec ago, probe_cooldown=%u sec",
               (unsigned)fwplusVersionByNode.size(),
@@ -2244,6 +2351,140 @@ NodeNum DtnOverlayModule::chooseHandoffTarget(NodeNum dest, uint32_t origId, Pen
     
     LOG_DEBUG("DTN: Selected handoff candidate: 0x%x (dest rotation=%u)", (unsigned)pick, (unsigned)ph.rotationIndex);
     return pick;
+}
+
+/**
+ * Progressive Relay Strategy for Unknown/Distant Destinations
+ * 
+ * When destination routing is unknown (hops=255) or too distant (hops > HOP_MAX=7),
+ * forward to the furthest known FW+ node that might be "in the direction" of the destination.
+ * 
+ * This creates a relay chain where each intermediate node makes its own forwarding decision
+ * based on its local routing knowledge, progressively moving the packet toward the destination.
+ * 
+ * Strategy:
+ * - Find all known FW+ nodes with valid hops_away
+ * - Prioritize nodes that are:
+ *   1. Further away (higher hops from source)
+ *   2. Not in our immediate neighborhood
+ *   3. Recently active (seen in last minute)
+ * - Avoid loops by tracking progressive relay history
+ * 
+ * Returns: NodeNum of edge node for relay, or 0 if none found
+ */
+NodeNum DtnOverlayModule::chooseProgressiveRelay(NodeNum dest, Pending &p)
+{
+    LOG_DEBUG("DTN: Evaluating progressive relay options for dest 0x%x", (unsigned)dest);
+    
+    // Check if we've already tried this relay chain too many times
+    if (p.progressiveRelayCount >= 3) {
+        LOG_WARN("DTN: Max progressive relay chain reached (%u hops) - cannot relay further", 
+                 p.progressiveRelayCount);
+        return 0;
+    }
+    
+    struct EdgeCandidate {
+        NodeNum node;
+        uint8_t hopsFromUs;
+        float score;
+    };
+    
+    std::vector<EdgeCandidate> candidates;
+    int totalNodes = nodeDB->getNumMeshNodes();
+    
+    for (int i = 0; i < totalNodes; ++i) {
+        meshtastic_NodeInfoLite *ni = nodeDB->getMeshNodeByIndex(i);
+        if (!ni) continue;
+        if (ni->num == nodeDB->getNodeNum()) continue;  // Skip self
+        if (ni->num == dest) continue;  // Skip destination
+        if (!isFwplus(ni->num)) continue;  // Only FW+ nodes
+        
+        uint8_t hops = ni->hops_away;
+        
+        // Only consider reachable nodes (not unknown or direct)
+        if (hops == 255 || hops == 0) continue;
+        
+        // Check if node is reachable
+        if (!isNodeReachable(ni->num)) continue;
+        
+        // Check version compatibility
+        auto itVer = fwplusVersionByNode.find(ni->num);
+        if (itVer == fwplusVersionByNode.end() || 
+            itVer->second < configMinFwplusVersionForHandoff) continue;
+        
+        // Loop prevention: check if we've already tried this relay
+        bool alreadyTried = false;
+        for (uint8_t j = 0; j < p.progressiveRelayCount && j < 3; ++j) {
+            if (p.progressiveRelays[j] == ni->num) {
+                alreadyTried = true;
+                break;
+            }
+        }
+        if (alreadyTried) {
+            LOG_DEBUG("DTN: Skipping progressive relay 0x%x - already in relay chain", (unsigned)ni->num);
+            ctrProgressiveRelayLoops++;
+            continue;
+        }
+        
+        // Also check carrier loop (avoid sending back to recent carriers)
+        if (isCarrierLoop(p, ni->num)) {
+            LOG_DEBUG("DTN: Skipping progressive relay 0x%x - carrier loop detected", (unsigned)ni->num);
+            continue;
+        }
+        
+        EdgeCandidate ec;
+        ec.node = ni->num;
+        ec.hopsFromUs = hops;
+        
+        // Direction score: prefer nodes that are:
+        // 1. Further away (higher hops) - likely to have different topology view
+        // 2. Not immediate neighbors (hops >= 2 preferred)
+        ec.score = (float)hops;
+        
+        // Bonus for nodes seen recently (active relay candidates)
+        auto seenIt = fwplusSeenMs.find(ni->num);
+        if (seenIt != fwplusSeenMs.end()) {
+            uint32_t age = millis() - seenIt->second;
+            if (age < 60000) {  // Seen in last minute
+                ec.score += 1.0f;
+            }
+        }
+        
+        // Bonus for nodes at hops >= 2 (edge of our knowledge)
+        if (hops >= 2) {
+            ec.score += 0.5f;
+        }
+        
+        candidates.push_back(ec);
+    }
+    
+    if (candidates.empty()) {
+        LOG_WARN("DTN: No edge nodes found for progressive relay to dest 0x%x", (unsigned)dest);
+        return 0;
+    }
+    
+    // Sort by score (furthest + active first)
+    std::sort(candidates.begin(), candidates.end(), 
+              [](const EdgeCandidate& a, const EdgeCandidate& b) {
+                  return a.score > b.score;
+              });
+    
+    // Choose top candidate
+    EdgeCandidate best = candidates[0];
+    
+    LOG_INFO("DTN: Progressive relay dest=0x%x via edge node=0x%x (hops=%u score=%.1f chain=%u/%u)",
+             (unsigned)dest, (unsigned)best.node, best.hopsFromUs, best.score,
+             p.progressiveRelayCount + 1, 3);
+    
+    // Track this relay to prevent loops
+    if (p.progressiveRelayCount < 3) {
+        p.progressiveRelays[p.progressiveRelayCount] = best.node;
+        p.progressiveRelayCount++;
+    }
+    
+    ctrProgressiveRelays++;
+    
+    return best.node;
 }
 
 // Purpose: invalidate stale routes for mobile nodes to prevent using outdated handoff candidates
@@ -2625,7 +2866,48 @@ NodeNum DtnOverlayModule::selectForwardTarget(Pending &p)
     
     if (configEnableFwplusHandoff) {
         uint8_t hopsToDest = getHopsAway(p.data.orig_to);
-        if (hopsToDest != 255 && hopsToDest >= configHandoffMinRing) {
+        
+        // === CASE 1: Unknown Route (hops=255) - Use Progressive Relay ===
+        if (hopsToDest == 255) {
+            LOG_INFO("DTN: Destination 0x%x unknown (hops=255) - attempting progressive relay", 
+                     (unsigned)p.data.orig_to);
+            
+            NodeNum edgeNode = chooseProgressiveRelay(p.data.orig_to, p);
+            if (edgeNode != 0) {
+                target = edgeNode;
+                LOG_INFO("DTN: Progressive relay to edge node 0x%x (unknown dest 0x%x)", 
+                         (unsigned)target, (unsigned)p.data.orig_to);
+            } else {
+                LOG_WARN("DTN: No progressive relay available for unknown dest 0x%x - direct attempt",
+                         (unsigned)p.data.orig_to);
+                // Keep target as orig_to (direct delivery attempt - will likely use fallback)
+            }
+        }
+        // === CASE 2: Too Distant (hops > HOP_MAX=7) - Use Progressive Relay ===
+        else if (hopsToDest > HOP_MAX) {
+            LOG_INFO("DTN: Destination 0x%x too far (hops=%u > max=%u) - attempting progressive relay",
+                     (unsigned)p.data.orig_to, hopsToDest, HOP_MAX);
+            
+            NodeNum edgeNode = chooseProgressiveRelay(p.data.orig_to, p);
+            if (edgeNode != 0) {
+                target = edgeNode;
+                LOG_INFO("DTN: Progressive relay to edge node 0x%x (distant dest 0x%x)",
+                         (unsigned)target, (unsigned)p.data.orig_to);
+            } else {
+                // No progressive relay available - try normal handoff as fallback
+                NodeNum cand = chooseHandoffTarget(p.data.orig_to, 0, p);
+                if (cand != 0 && isValidHandoffCandidate(cand, p.data.orig_to, p)) {
+                    target = cand;
+                    LOG_INFO("DTN: Using handoff target 0x%x for distant dest (no progressive relay)",
+                             (unsigned)target);
+                } else {
+                    LOG_WARN("DTN: No relay available for distant dest 0x%x - direct attempt",
+                             (unsigned)p.data.orig_to);
+                }
+            }
+        }
+        // === CASE 3: Known Route within HOP_MAX - Normal Handoff ===
+        else if (hopsToDest >= configHandoffMinRing) {
             // Try to find handoff candidate - chooseHandoffTarget returns 0 if none available
             NodeNum cand = chooseHandoffTarget(p.data.orig_to, 0, p);
             if (cand != 0 && isValidHandoffCandidate(cand, p.data.orig_to, p)) {
