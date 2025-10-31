@@ -16,49 +16,118 @@ extern BroadcastAssistModule *broadcastAssistModule;
 
 NextHopRouter::NextHopRouter() {}
 //fw++
+// Purpose: DV-ETX route learning from traceroute paths
+// Supports both ACTIVE learning (we're in path) and PASSIVE learning (we relay foreign traceroute)
+// This enables faster routing table buildup in large networks (100-200 nodes)
 void NextHopRouter::processPathAndLearn(const uint32_t *path, size_t maxHops,
                                         const int8_t *snrList, size_t maxSnr,
                                         const meshtastic_MeshPacket *p)
 {
-    if (!path || maxHops < 2) return;
+    if (!path || maxHops < 2) {
+        LOG_DEBUG("NextHop: processPathAndLearn guard: path=%p maxHops=%u", path, (unsigned)maxHops);
+        return;
+    }
     uint32_t selfNum = getNodeNum();
     int selfIdx = -1;
     for (size_t i = 0; i < maxHops; ++i) {
         if (path[i] == selfNum) { selfIdx = (int)i; break; }
     }
-    if (selfIdx < 0 || (selfIdx + 1) >= (int)maxHops) return;
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // DV-ETX ACTIVE LEARNING: We are in path (high confidence)
+    // ═══════════════════════════════════════════════════════════════════
+    if (selfIdx >= 0 && (selfIdx + 1) < (int)maxHops) {
+        uint32_t dest = path[maxHops - 1];
+        uint8_t nextHop = (uint8_t)(path[selfIdx + 1] & 0xFF);
 
-    uint32_t dest = path[maxHops - 1];
-    uint8_t nextHop = (uint8_t)(path[selfIdx + 1] & 0xFF);
+        // Gate on direct neighbor presence for the candidate last byte
+        if (!isDirectNeighborLastByte(nextHop)) {
+            LOG_DEBUG("NextHop: Skip ACTIVE learn: nextHop 0x%x is not a direct neighbor", nextHop);
+            return;  // Can't learn if next hop isn't our direct neighbor
+        }
 
-    // Gate on direct neighbor presence for the candidate last byte
-    if (!isDirectNeighborLastByte(nextHop)) {
-        LOG_DEBUG("Skip learnRoute: nextHop 0x%x is not a direct neighbor", nextHop);
-        return;
+        float linkEtx = 2.0f;
+        if (snrList && maxSnr > (size_t)selfIdx) {
+            float snr = (float)snrList[selfIdx] / 4.0f;
+            linkEtx = estimateEtxFromSnr(snr);
+        } else if (p) {
+            linkEtx = estimateEtxFromSnr(p->rx_snr);
+        } else {
+            linkEtx = 1.5f; // Default conservative ETX when no SNR data available (DTN custody chains)
+        }
+        int remainingHops = (int)maxHops - selfIdx - 1;
+        float observedCost = linkEtx + (remainingHops > 1 ? (remainingHops - 1) * 1.0f : 0.0f);
+        learnRoute(dest, nextHop, observedCost);
+        LOG_INFO("NextHop: ACTIVE LEARN dest=0x%x via=0x%x cost=%.1f SNR=%.1f pathlen=%u pos=%d [IN-PATH TRACEROUTE]", 
+                 dest, nextHop, observedCost, linkEtx, (unsigned)maxHops, selfIdx);
     }
-
-    float linkEtx = 2.0f;
-    if (snrList && maxSnr > (size_t)selfIdx) {
-        float snr = (float)snrList[selfIdx] / 4.0f;
-        linkEtx = estimateEtxFromSnr(snr);
-    } else {
-        linkEtx = estimateEtxFromSnr(p->rx_snr);
+    // ═══════════════════════════════════════════════════════════════════
+    // DV-ETX PASSIVE LEARNING: We relay foreign traceroute (opportunistic)
+    // ═══════════════════════════════════════════════════════════════════
+    // If we're NOT in path but relaying this traceroute, we can infer:
+    // "destination is reachable via the neighbor who sent us this traceroute"
+    // This dramatically speeds up route discovery in large networks (100-200 nodes)
+    else if (selfIdx < 0 && maxHops >= 2) {
+        //fw+ CRITICAL: Check if p is not nullptr before accessing (DTN custody chains pass nullptr)
+        if (!p) {
+            LOG_DEBUG("NextHop: Skip PASSIVE learn: no packet context (DTN custody chain, need packet for receivedFrom)");
+            return;
+        }
+        
+        uint32_t dest = path[maxHops - 1];  // Final destination
+        uint32_t receivedFrom = getFrom(p);  // Who sent us this packet
+        uint8_t viaHop = (uint8_t)(receivedFrom & 0xFF);
+        
+        LOG_DEBUG("NextHop: PASSIVE candidate: dest=0x%x via=0x%x (from=0x%x) selfIdx=%d", 
+                  dest, viaHop, receivedFrom, selfIdx);
+        
+        // Only learn if receivedFrom is our direct neighbor
+        if (!isDirectNeighborLastByte(viaHop)) {
+            LOG_DEBUG("NextHop: Skip PASSIVE learn: viaHop 0x%x is not a direct neighbor", viaHop);
+            return;  // Can't use as next hop if not direct neighbor
+        }
+        
+        // ETX calculation for our link to the neighbor (same as active)
+        float linkEtx = estimateEtxFromSnr(p->rx_snr);
+        
+        // DV cost estimation: link ETX + conservative path estimate
+        // We use path length + small penalty for uncertainty
+        float estimatedCost = linkEtx + (float)(maxHops - 1) * 1.1f;
+        
+        // Update DV-ETX routing table with passive observation
+        // Note: learnRoute() internally uses EMA smoothing and confidence tracking
+        learnRoute(dest, viaHop, estimatedCost);
+        LOG_INFO("NextHop: PASSIVE LEARN dest=0x%x via=0x%x cost=%.1f SNR=%.1f pathlen=%u [RELAY DISCOVERY]", 
+                 dest, viaHop, estimatedCost, p->rx_snr, (unsigned)maxHops);
     }
-    int remainingHops = (int)maxHops - selfIdx - 1;
-    float observedCost = linkEtx + (remainingHops > 1 ? (remainingHops - 1) * 1.0f : 0.0f);
-    learnRoute(dest, nextHop, observedCost);
 }
 //fw+
 void NextHopRouter::learnFromRouteDiscoveryPayload(const meshtastic_MeshPacket *p)
 {
+    if (!p) {
+        LOG_WARN("NextHop: learnFromRouteDiscoveryPayload called with NULL packet");
+        return;
+    }
+    
     meshtastic_RouteDiscovery rd = meshtastic_RouteDiscovery_init_zero;
-    if (!pb_decode_from_bytes(p->decoded.payload.bytes, p->decoded.payload.size, &meshtastic_RouteDiscovery_msg, &rd)) return;
+    if (!pb_decode_from_bytes(p->decoded.payload.bytes, p->decoded.payload.size, &meshtastic_RouteDiscovery_msg, &rd)) {
+        LOG_WARN("NextHop: Failed to decode RouteDiscovery from packet id=0x%x", p->id);
+        return;
+    }
 
     const size_t maxHops = rd.route_back_count ? rd.route_back_count : rd.route_count;
     const uint32_t *path = rd.route_back_count ? rd.route_back : rd.route;
     const size_t maxSnr = rd.snr_back_count ? rd.snr_back_count : rd.snr_towards_count;
     const int8_t *snrList = rd.snr_back_count ? rd.snr_back : rd.snr_towards;
-    processPathAndLearn(path, maxHops, snrList, maxSnr, p);
+    
+    LOG_DEBUG("NextHop: learnFromRouteDiscoveryPayload id=0x%x hops=%u path_type=%s", 
+              p->id, (unsigned)maxHops, rd.route_back_count ? "back" : "forward");
+    
+    //fw+ Skip passive learning for traceroute responses (isToUs) to avoid reversed path bug
+    if (!isToUs(p)) {
+        processPathAndLearn(path, maxHops, snrList, maxSnr, p);
+    }
+    
     if (isToUs(p) && rd.route_count > 0) {
         uint8_t firstHop = (uint8_t)(rd.route[0] & 0xFF);
         if (isDirectNeighborLastByte(firstHop)) {
@@ -73,6 +142,20 @@ void NextHopRouter::learnFromRouteDiscoveryPayload(const meshtastic_MeshPacket *
             learnRoute(destNode, firstHop, observedCost);
         }
     }
+}
+//fw+
+void NextHopRouter::learnFromDtnCustodyPath(const uint32_t *path, size_t pathLen)
+{
+    if (!path || pathLen < 2) {
+        LOG_DEBUG("NextHop: learnFromDtnCustodyPath called with invalid path (len=%u)", (unsigned)pathLen);
+        return;
+    }
+    
+    // Call processPathAndLearn with DTN custody chain
+    // No SNR data available from custody chains, so we pass nullptr
+    processPathAndLearn(path, pathLen, nullptr, 0, nullptr);
+    
+    LOG_INFO("NextHop: Learned from DTN custody chain (len=%u)", (unsigned)pathLen);
 }
 //fw+
 void NextHopRouter::learnFromRoutingPayload(const meshtastic_MeshPacket *p)
@@ -250,31 +333,8 @@ bool NextHopRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
                                         &wasUpgraded); // Updates history; returns false when an upgrade is detected
 
     // Handle hop_limit upgrade scenario for rebroadcasters
-    // isRebroadcaster() is duplicated in perhapsRelay(), but this avoids confusing log messages
-    if (wasUpgraded && isRebroadcaster() && iface && p->hop_limit > 0) {
-        // Upgrade detection bypasses the duplicate short-circuit so we replace the queued packet before exiting
-        uint8_t dropThreshold = p->hop_limit; // remove queued packets that have fewer hops remaining
-        if (iface->removePendingTXPacket(getFrom(p), p->id, dropThreshold)) {
-            LOG_DEBUG("Processing upgraded packet 0x%08x for relay with hop limit %d (dropping queued < %d)", p->id, p->hop_limit,
-                      dropThreshold);
-
-            if (nodeDB)
-                nodeDB->updateFrom(*p);
-#if !MESHTASTIC_EXCLUDE_TRACEROUTE
-            if (traceRouteModule && p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
-                p->decoded.portnum == meshtastic_PortNum_TRACEROUTE_APP)
-                traceRouteModule->processUpgradedPacket(*p);
-#endif
-
-            perhapsRelay(p);
-
-            // We already enqueued the improved copy, so make sure the incoming packet stops here.
-            return true;
-        }
-
-        // No queue entry was replaced by this upgraded copy, so treat it as a duplicate to avoid
-        // delivering the same packet to applications/phone twice with different hop limits.
-        seenRecently = true;
+    if (wasUpgraded && perhapsHandleUpgradedPacket(p)) {
+        return true; // we handled it, so stop processing
     }
 
     if (seenRecently) {
@@ -293,14 +353,20 @@ bool NextHopRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
         if (wasFallback) {
             LOG_INFO("Fallback to flooding from relay_node=0x%x", p->relay_node);
             // Check if it's still in the Tx queue, if not, we have to relay it again
-            if (!findInTxQueue(p->from, p->id))
-                perhapsRelay(p);
+            if (!findInTxQueue(p->from, p->id)) {
+                reprocessPacket(p);
+                perhapsRebroadcast(p);
+            }
         } else {
             bool isRepeated = p->hop_start > 0 && p->hop_start == p->hop_limit;
             // If repeated and not in Tx queue anymore, try relaying again, or if we are the destination, send the ACK again
             if (isRepeated) {
-                if (!findInTxQueue(p->from, p->id) && !perhapsRelay(p) && isToUs(p) && p->want_ack)
-                    sendAckNak(meshtastic_Routing_Error_NONE, getFrom(p), p->id, p->channel, 0);
+                if (!findInTxQueue(p->from, p->id)) {
+                    reprocessPacket(p);
+                    if (!perhapsRebroadcast(p) && isToUs(p) && p->want_ack) {
+                        sendAckNak(meshtastic_Routing_Error_NONE, getFrom(p), p->id, p->channel, 0);
+                    }
+                }
             } else if (!weWereNextHop) {
                 perhapsCancelDupe(p); // If it's a dupe, cancel relay if we were not explicitly asked to relay
             }
@@ -359,13 +425,14 @@ void NextHopRouter::sniffReceived(const meshtastic_MeshPacket *p, const meshtast
     bool isAckorReply = (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag) &&
                         (p->decoded.request_id != 0 || p->decoded.reply_id != 0);
     if (isAckorReply) {
-        // Update next-hop for the original transmitter of this successful transmission to the relay node, but ONLY if "from" is
-        // not 0 (means implicit ACK) and original packet was also relayed by this node, or we sent it directly to the destination
+        // Update next-hop for the original transmitter of this successful transmission to the relay node, but ONLY if "from"
+        // is not 0 (means implicit ACK) and original packet was also relayed by this node, or we sent it directly to the
+        // destination
         if (p->from != 0) {
             meshtastic_NodeInfoLite *origTx = nodeDB->getMeshNode(p->from);
             if (origTx) {
-                // Either relayer of ACK was also a relayer of the packet, or we were the *only* relayer and the ACK came directly
-                // from the destination
+                // Either relayer of ACK was also a relayer of the packet, or we were the *only* relayer and the ACK came
+                // directly from the destination
                 bool wasAlreadyRelayer = wasRelayer(p->relay_node, p->decoded.request_id, p->to);
                 bool weWereSoleRelayer = false;
                 bool weWereRelayer = wasRelayer(ourRelayID, p->decoded.request_id, p->to, &weWereSoleRelayer);
@@ -392,7 +459,7 @@ void NextHopRouter::sniffReceived(const meshtastic_MeshPacket *p, const meshtast
         }
     }
 
-    // fw+ traceroute learning: if this is a traceroute/routing control with route info, learn next-hop hints
+    //fw+ traceroute learning: if this is a traceroute/routing control with route info, learn next-hop hints
     if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag) {
         if (p->decoded.portnum == meshtastic_PortNum_TRACEROUTE_APP) {
             learnFromRouteDiscoveryPayload(p);
@@ -401,7 +468,7 @@ void NextHopRouter::sniffReceived(const meshtastic_MeshPacket *p, const meshtast
         }
     }
 
-    perhapsRelay(p);
+    perhapsRebroadcast(p);
     //fw+ delegate proactive scheduling to a helper to ease upstream merges
     maybeScheduleTraceroute(millis());
 
@@ -535,8 +602,8 @@ bool NextHopRouter::sendTracerouteTo(uint32_t dest)
     return true;
 }
 
-/* Check if we should be relaying this packet if so, do so. */
-bool NextHopRouter::perhapsRelay(const meshtastic_MeshPacket *p)
+//fw+ Check if we should be rebroadcasting this packet (with HeardAssist throttle and retrans pool)
+bool NextHopRouter::perhapsRebroadcast(const meshtastic_MeshPacket *p)
 {
     //fw+
     if (!isToUs(p) && (p->hop_limit <= 0) && !isFromUs(p)) {
@@ -544,7 +611,7 @@ bool NextHopRouter::perhapsRelay(const meshtastic_MeshPacket *p)
     }
 
     if (!isToUs(p) && !isFromUs(p) && p->hop_limit > 0) {
-        // fw+ Optional throttle for text broadcasts based on HeardAssist
+        //fw+ Optional throttle for text broadcasts based on HeardAssist
         if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag && p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP) {
             uint32_t jitter = 0;
             if (shouldRelayTextWithThrottle(p, jitter)) {
@@ -564,41 +631,44 @@ bool NextHopRouter::perhapsRelay(const meshtastic_MeshPacket *p)
             }
         }
         // Check if packet has next_hop not set OR addressed to us
-        if (p->next_hop == NO_NEXT_HOP_PREFERENCE || p->next_hop == nodeDB->getLastByteOfNodeNum(getNodeNum())) {
+        if (p->id != 0) {
             if (isRebroadcaster()) {
-                //fw+ use retrans pool first; preserve hop_limit when policy dictates
-                meshtastic_MeshPacket *tosend = retransPacketPool.allocCopy(*p);
-                if (!tosend) tosend = packetPool.allocCopy(*p);
-                if (tosend) {
-                    LOG_INFO("Relaying received message coming from %x", p->relay_node);
-                    
-                    // Use shared logic to determine if hop_limit should be decremented
-                    if (shouldDecrementHopLimit(p)) {
-                        tosend->hop_limit--; // bump down the hop count
-                    } else {
-                        LOG_INFO("favorite-ROUTER/CLIENT_BASE-to-ROUTER/CLIENT_BASE relay: preserving hop_limit");
-                    }
+                if (p->next_hop == NO_NEXT_HOP_PREFERENCE || p->next_hop == nodeDB->getLastByteOfNodeNum(getNodeNum())) {
+                    //fw+ use retrans pool first; preserve hop_limit when policy dictates
+                    meshtastic_MeshPacket *tosend = retransPacketPool.allocCopy(*p);
+                    if (!tosend) tosend = packetPool.allocCopy(*p);
+                    if (tosend) {
+                        LOG_INFO("Rebroadcast received message coming from %x", p->relay_node);
+                        
+                        // Use shared logic to determine if hop_limit should be decremented
+                        if (shouldDecrementHopLimit(p)) {
+                            tosend->hop_limit--; // bump down the hop count
+                        } else {
+                            LOG_INFO("favorite-ROUTER/CLIENT_BASE-to-ROUTER/CLIENT_BASE rebroadcast: preserving hop_limit");
+                        }
 #if USERPREFS_EVENT_MODE
-                    if (tosend->hop_limit > 2) {
-                        // if we are "correcting" the hop_limit, "correct" the hop_start by the same amount to preserve hops away.
-                        tosend->hop_start -= (tosend->hop_limit - 2);
-                        tosend->hop_limit = 2;
-                    }
+                        if (tosend->hop_limit > 2) {
+                            // if we are "correcting" the hop_limit, "correct" the hop_start by the same amount to preserve hops away.
+                            tosend->hop_start -= (tosend->hop_limit - 2);
+                            tosend->hop_limit = 2;
+                        }
 #endif
 
-                    if (p->next_hop == NO_NEXT_HOP_PREFERENCE) {
-                        FloodingRouter::send(tosend);
+                        if (p->next_hop == NO_NEXT_HOP_PREFERENCE) {
+                            FloodingRouter::send(tosend);
+                        } else {
+                            NextHopRouter::send(tosend);
+                        }
+                        return true;
                     } else {
-                        NextHopRouter::send(tosend);
+                        LOG_WARN("Pool exhausted; skipping relay");
                     }
-                } else {
-                    LOG_WARN("Pool exhausted; skipping relay");
                 }
-
-                return true;
             } else {
-                LOG_DEBUG("Not relaying: Role = CLIENT_MUTE or Rebroadcast Mode = NONE");
+                LOG_DEBUG("No rebroadcast: Role = CLIENT_MUTE or Rebroadcast Mode = NONE");
             }
+        } else {
+            LOG_DEBUG("Ignore 0 id broadcast");
         }
     }
 
@@ -668,13 +738,13 @@ bool NextHopRouter::stopRetransmission(GlobalPacketId key)
             }
         }
 
-        // Regardless of whether or not we canceled this packet from the txQueue, remove it from our pending list so it doesn't
-        // get scheduled again. (This is the core of stopRetransmission.)
+        // Regardless of whether or not we canceled this packet from the txQueue, remove it from our pending list so it
+        // doesn't get scheduled again. (This is the core of stopRetransmission.)
         auto numErased = pending.erase(key);
         assert(numErased == 1);
 
-        // When we remove an entry from pending, always be sure to release the copy of the packet that was allocated in the call
-        // to startRetransmission.
+        // When we remove an entry from pending, always be sure to release the copy of the packet that was allocated in the
+        // call to startRetransmission.
         packetPool.release(p);
 
         return true;

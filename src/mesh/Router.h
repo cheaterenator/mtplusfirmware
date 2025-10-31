@@ -10,6 +10,8 @@
 #include "concurrency/OSThread.h"
 #include "PacketCounter.h"
 
+class NextHopRouter; // forward declaration for RTTI-free downcast helpers
+
 /**
  * A mesh aware router that supports multiple interfaces.
  */
@@ -29,6 +31,10 @@ class Router : protected concurrency::OSThread, protected PacketHistory
      *
      */
     Router();
+
+    //fw+ RTTI-free helper for modules that need NextHopRouter specifics
+    virtual NextHopRouter *asNextHopRouter() { return nullptr; }
+    virtual const NextHopRouter *asNextHopRouter() const { return nullptr; }
     /**
      * Currently we only allow one interface, that may change in the future
      */
@@ -74,6 +80,9 @@ class Router : protected concurrency::OSThread, protected PacketHistory
     //fw+ DV-ETX adaptation hooks (no-op by default; overridden by NextHopRouter)
     virtual void rewardRouteOnDelivered(PacketId /*originalId*/, NodeNum /*sourceNode*/, uint8_t /*viaHopLastByte*/, int8_t /*rxSnr*/) {}
     virtual void penalizeRouteOnFailed(PacketId /*originalId*/, NodeNum /*sourceNode*/, uint8_t /*viaHopLastByte*/, uint32_t /*reasonCode*/) {}
+
+    //fw+ FIX #21: Clear packet history for specific ID (for DTN local delivery to avoid duplicate suppression)
+    void clearPacketHistory(PacketId id);
 
     /**
      * RadioInterface calls this to queue up packets that have been received from the radio.  The router is now responsible for

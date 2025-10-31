@@ -68,6 +68,9 @@ class NextHopRouter : public FloodingRouter
      */
     NextHopRouter();
 
+    NextHopRouter *asNextHopRouter() override { return this; }
+    const NextHopRouter *asNextHopRouter() const override { return this; }
+
     /**
      * Send a packet
      * @return an error code
@@ -95,6 +98,14 @@ class NextHopRouter : public FloodingRouter
     //fw+ Adapt DV-ETX using S&F custody signals (override Router's no-op)
     void rewardRouteOnDelivered(PacketId originalId, NodeNum sourceNode, uint8_t viaHopLastByte, int8_t rxSnr) override;
     void penalizeRouteOnFailed(PacketId originalId, NodeNum sourceNode, uint8_t viaHopLastByte, uint32_t reasonCode) override;
+
+    //fw+ PUBLIC API for route learning from traceroute packets (called by TraceRouteModule)
+    // This enables ACTIVE and PASSIVE DV-ETX learning from traceroute responses
+    void learnFromRouteDiscoveryPayload(const meshtastic_MeshPacket *p);
+    
+    //fw+ PUBLIC API for route learning from DTN custody chains (called by DtnOverlayModule)
+    // This enables PASSIVE DV-ETX learning from observed DTN custody paths
+    void learnFromDtnCustodyPath(const uint32_t *path, size_t pathLen);
 
   protected:
     /**
@@ -154,8 +165,7 @@ class NextHopRouter : public FloodingRouter
     void learnRoute(uint32_t dest, uint8_t viaHop, float observedCost);
     void invalidateRoute(uint32_t dest, float penalty = 1.0f);
     float estimateEtxFromSnr(float snr) const;
-    // fw+ nexthop snif
-    void learnFromRouteDiscoveryPayload(const meshtastic_MeshPacket *p);
+    // fw+ nexthop snif (learnFromRouteDiscoveryPayload now in public section above)
     void learnFromRoutingPayload(const meshtastic_MeshPacket *p);
     void processPathAndLearn(const uint32_t *path, size_t maxHops,
                              const int8_t *snrList, size_t maxSnr,
@@ -237,11 +247,12 @@ class NextHopRouter : public FloodingRouter
      */
     uint8_t getNextHop(NodeNum to, uint8_t relay_node);
 
-    /** Check if we should be relaying this packet if so, do so.
-     *  @return true if we did relay */
-    bool perhapsRelay(const meshtastic_MeshPacket *p);
+    /** Check if we should be rebroadcasting this packet if so, do so.
+     *  @return true if we did rebroadcast */
+    bool perhapsRebroadcast(const meshtastic_MeshPacket *p) override;
 
   public:
+    //fw+ Public API for route introspection
     struct PublicRouteEntry {
         uint32_t dest;
         uint8_t next_hop;
@@ -250,7 +261,7 @@ class NextHopRouter : public FloodingRouter
         uint32_t lastUpdatedMs;
     };
 
-    // Adaptive TTL: base + per-confidence increment, clamped to max
+    //fw+ Adaptive TTL: base + per-confidence increment, clamped to max
     constexpr static uint32_t ROUTE_TTL_BASE_MS = 24UL * 60UL * 60UL * 1000UL;   // 24 hours
     constexpr static uint32_t ROUTE_TTL_PER_CONF_MS = 12UL * 60UL * 60UL * 1000UL; // +12 hours per confidence
     constexpr static uint32_t ROUTE_TTL_MAX_MS = 7UL * 24UL * 60UL * 60UL * 1000UL; // cap at 7 days

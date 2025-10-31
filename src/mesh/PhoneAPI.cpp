@@ -15,6 +15,7 @@
 #include "Router.h"
 #include "SPILock.h"
 #include "TypeConversions.h"
+#include "concurrency/LockGuard.h"
 #include "main.h"
 #include "xmodem.h"
 
@@ -22,6 +23,8 @@
 #include "modules/DtnOverlayModule.h"
 extern DtnOverlayModule *dtnOverlayModule;
 #endif
+
+#include "modules/RoutingModule.h"
 
 #if FromRadio_size > MAX_TO_FROM_RADIO_SIZE
 #error FromRadio is too big
@@ -50,6 +53,29 @@ PhoneAPI::~PhoneAPI()
     close();
 }
 
+//fw+ FIX #108a: Helper function to send DTN ACCEPTED receipt to APK
+// Purpose: Inform APK that DTN has accepted custody of the message
+// Called: Immediately after DTN intercept in PhoneAPI
+// Result: APK shows "DTN processing" status
+void PhoneAPI::sendDtnAcceptedReceipt(PacketId origId, ChannelIndex channel)
+{
+#if __has_include("modules/DtnOverlayModule.h")
+    if (!dtnOverlayModule) {
+        return; // DTN not available
+    }
+    
+    // Send PROGRESSED receipt with reason=self (DTN accepted)
+    dtnOverlayModule->emitReceipt(
+        nodeDB->getNodeNum(),                                    // to (self)
+        origId,                                                  // orig_id
+        meshtastic_FwplusDtnStatus_FWPLUS_DTN_STATUS_PROGRESSED, // status
+        nodeDB->getNodeNum()                                     // reason (self = DTN accepted)
+    );
+    
+    LOG_INFO("DTN: Sent ACCEPTED receipt to APK for id=0x%x (UX: 'DTN custody')", (unsigned)origId);
+#endif
+}
+
 void PhoneAPI::handleStartConfig()
 {
     // Must be before setting state (because state is how we know !connected)
@@ -60,6 +86,9 @@ void PhoneAPI::handleStartConfig()
         observe(&xModem.packetReady);
 #endif
     }
+
+    // Allow subclasses to prepare for high-throughput config traffic
+    onConfigStart();
 
     // even if we were already connected - restart our state machine
     if (config_nonce == SPECIAL_NONCE_ONLY_NODES) {
@@ -75,8 +104,13 @@ void PhoneAPI::handleStartConfig()
     spiLock->unlock();
     LOG_DEBUG("Got %d files in manifest", filesManifest.size());
 
-    LOG_INFO("Start API client config");
-    nodeInfoForPhone.num = 0; // Don't keep returning old nodeinfos
+    LOG_INFO("Start API client config millis=%u", millis());
+    // Protect against concurrent BLE callbacks: they run in NimBLE's FreeRTOS task and also touch nodeInfoQueue.
+    {
+        concurrency::LockGuard guard(&nodeInfoMutex);
+        nodeInfoForPhone = {};
+        nodeInfoQueue.clear();
+    }
     resetReadIndex();
 }
 
@@ -98,7 +132,12 @@ void PhoneAPI::close()
         onConnectionChanged(false);
         fromRadioScratch = {};
         toRadioScratch = {};
-        nodeInfoForPhone = {};
+        // Clear cached node info under lock because NimBLE callbacks can still be draining it.
+        {
+            concurrency::LockGuard guard(&nodeInfoMutex);
+            nodeInfoForPhone = {};
+            nodeInfoQueue.clear();
+        }
         packetForPhone = NULL;
         filesManifest.clear();
         fromRadioNum = 0;
@@ -153,6 +192,10 @@ bool PhoneAPI::handleToRadio(const uint8_t *buf, size_t bufLength)
 #if !MESHTASTIC_EXCLUDE_MQTT
         case meshtastic_ToRadio_mqttClientProxyMessage_tag:
             LOG_DEBUG("Got MqttClientProxy message");
+            if (state != STATE_SEND_PACKETS) {
+                LOG_WARN("Ignore MqttClientProxy message while completing config handshake");
+                break;
+            }
             if (mqtt && moduleConfig.mqtt.proxy_to_client_enabled && moduleConfig.mqtt.enabled &&
                 (channels.anyMqttEnabled() || moduleConfig.mqtt.map_reporting_enabled)) {
                 mqtt->onClientProxyReceive(toRadioScratch.mqttClientProxyMessage);
@@ -244,13 +287,20 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
         LOG_DEBUG("Send My NodeInfo");
         auto us = nodeDB->readNextMeshNode(readIndex);
         if (us) {
-            nodeInfoForPhone = TypeConversions::ConvertToNodeInfo(us);
-            nodeInfoForPhone.has_hops_away = false;
-            nodeInfoForPhone.is_favorite = true;
+            auto info = TypeConversions::ConvertToNodeInfo(us);
+            info.has_hops_away = false;
+            info.is_favorite = true;
+            {
+                concurrency::LockGuard guard(&nodeInfoMutex);
+                nodeInfoForPhone = info;
+            }
             fromRadioScratch.which_payload_variant = meshtastic_FromRadio_node_info_tag;
-            fromRadioScratch.node_info = nodeInfoForPhone;
+            fromRadioScratch.node_info = info;
             // Should allow us to resume sending NodeInfo in STATE_SEND_OTHER_NODEINFOS
-            nodeInfoForPhone.num = 0;
+            {
+                concurrency::LockGuard guard(&nodeInfoMutex);
+                nodeInfoForPhone.num = 0;
+            }
         }
         if (config_nonce == SPECIAL_NONCE_ONLY_NODES) {
             // If client only wants node info, jump directly to sending nodes
@@ -441,17 +491,44 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
         break;
 
     case STATE_SEND_OTHER_NODEINFOS: {
-        if (nodeInfoForPhone.num != 0) {
+        if (readIndex == 2) { //  readIndex==2 will be true for the first non-us node
+            LOG_INFO("Start sending nodeinfos millis=%u", millis());
+        }
+
+        meshtastic_NodeInfo infoToSend = {};
+        {
+            concurrency::LockGuard guard(&nodeInfoMutex);
+            if (nodeInfoForPhone.num == 0 && !nodeInfoQueue.empty()) {
+                // Serve the next cached node without re-reading from the DB iterator.
+                nodeInfoForPhone = nodeInfoQueue.front();
+                nodeInfoQueue.pop_front();
+            }
+            infoToSend = nodeInfoForPhone;
+            if (infoToSend.num != 0)
+                nodeInfoForPhone = {};
+        }
+
+        if (infoToSend.num != 0) {
             // Just in case we stored a different user.id in the past, but should never happen going forward
-            sprintf(nodeInfoForPhone.user.id, "!%08x", nodeInfoForPhone.num);
-            LOG_INFO("nodeinfo: num=0x%x, lastseen=%u, id=%s, name=%s", nodeInfoForPhone.num, nodeInfoForPhone.last_heard,
-                     nodeInfoForPhone.user.id, nodeInfoForPhone.user.long_name);
+            sprintf(infoToSend.user.id, "!%08x", infoToSend.num);
+
+            // Logging this really slows down sending nodes on initial connection because the serial console is so slow, so only
+            // uncomment if you really need to:
+            // LOG_INFO("nodeinfo: num=0x%x, lastseen=%u, id=%s, name=%s", nodeInfoForPhone.num, nodeInfoForPhone.last_heard,
+            // nodeInfoForPhone.user.id, nodeInfoForPhone.user.long_name);
+
+            // Occasional progress logging. (readIndex==2 will be true for the first non-us node)
+            if (readIndex == 2 || readIndex % 20 == 0) {
+                LOG_DEBUG("nodeinfo: %d/%d", readIndex, nodeDB->getNumMeshNodes());
+            }
+
             fromRadioScratch.which_payload_variant = meshtastic_FromRadio_node_info_tag;
-            fromRadioScratch.node_info = nodeInfoForPhone;
-            // Stay in current state until done sending nodeinfos
-            nodeInfoForPhone.num = 0; // We just consumed a nodeinfo, will need a new one next time
+            fromRadioScratch.node_info = infoToSend;
+            prefetchNodeInfos();
         } else {
-            LOG_DEBUG("Done sending nodeinfo");
+            LOG_DEBUG("Done sending %d of %d nodeinfos millis=%u", readIndex, nodeDB->getNumMeshNodes(), millis());
+            concurrency::LockGuard guard(&nodeInfoMutex);
+            nodeInfoQueue.clear();
             state = STATE_SEND_FILEMANIFEST;
             // Go ahead and send that ID right now
             return getFromRadio(buf);
@@ -531,11 +608,15 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
 
 void PhoneAPI::sendConfigComplete()
 {
-    LOG_INFO("Config Send Complete");
+    LOG_INFO("Config Send Complete millis=%u", millis());
     fromRadioScratch.which_payload_variant = meshtastic_FromRadio_config_complete_id_tag;
     fromRadioScratch.config_complete_id = config_nonce;
     config_nonce = 0;
     state = STATE_SEND_PACKETS;
+
+    // Allow subclasses to know we've entered steady-state so they can lower power consumption
+    onConfigComplete();
+
     pauseBluetoothLogging = false;
 }
 
@@ -553,6 +634,33 @@ void PhoneAPI::releaseQueueStatusPhonePacket()
         service->releaseQueueStatusToPool(queueStatusPacketForPhone);
         queueStatusPacketForPhone = NULL;
     }
+}
+
+void PhoneAPI::prefetchNodeInfos()
+{
+    bool added = false;
+    // Keep the queue topped up so BLE reads stay responsive even if DB fetches take a moment.
+    {
+        concurrency::LockGuard guard(&nodeInfoMutex);
+        while (nodeInfoQueue.size() < kNodePrefetchDepth) {
+            auto nextNode = nodeDB->readNextMeshNode(readIndex);
+            if (!nextNode)
+                break;
+
+            auto info = TypeConversions::ConvertToNodeInfo(nextNode);
+            bool isUs = info.num == nodeDB->getNodeNum();
+            info.hops_away = isUs ? 0 : info.hops_away;
+            info.last_heard = isUs ? getValidTime(RTCQualityFromNet) : info.last_heard;
+            info.snr = isUs ? 0 : info.snr;
+            info.via_mqtt = isUs ? false : info.via_mqtt;
+            info.is_favorite = info.is_favorite || isUs;
+            nodeInfoQueue.push_back(info);
+            added = true;
+        }
+    }
+
+    if (added)
+        onNowHasData(0);
 }
 
 void PhoneAPI::releaseMqttClientProxyPhonePacket()
@@ -590,22 +698,17 @@ bool PhoneAPI::available()
     case STATE_SEND_COMPLETE_ID:
         return true;
 
-    case STATE_SEND_OTHER_NODEINFOS:
-        if (nodeInfoForPhone.num == 0) {
-            auto nextNode = nodeDB->readNextMeshNode(readIndex);
-            if (nextNode) {
-                nodeInfoForPhone = TypeConversions::ConvertToNodeInfo(nextNode);
-                bool isUs = nodeInfoForPhone.num == nodeDB->getNodeNum();
-                nodeInfoForPhone.hops_away = isUs ? 0 : nodeInfoForPhone.hops_away;
-                nodeInfoForPhone.last_heard = isUs ? getValidTime(RTCQualityFromNet) : nodeInfoForPhone.last_heard;
-                nodeInfoForPhone.snr = isUs ? 0 : nodeInfoForPhone.snr;
-                nodeInfoForPhone.via_mqtt = isUs ? false : nodeInfoForPhone.via_mqtt;
-                nodeInfoForPhone.is_favorite = nodeInfoForPhone.is_favorite || isUs; // Our node is always a favorite
-
-                onNowHasData(0);
-            }
+    case STATE_SEND_OTHER_NODEINFOS: {
+        concurrency::LockGuard guard(&nodeInfoMutex);
+        if (nodeInfoQueue.empty()) {
+            // Drop the lock before prefetching; prefetchNodeInfos() will re-acquire it.
+            goto PREFETCH_NODEINFO;
         }
+    }
         return true; // Always say we have something, because we might need to advance our state machine
+    PREFETCH_NODEINFO:
+        prefetchNodeInfos();
+        return true;
     case STATE_SEND_PACKETS: {
         if (!queueStatusPacketForPhone)
             queueStatusPacketForPhone = service->getQueueStatusForPhone();
@@ -735,18 +838,28 @@ bool PhoneAPI::handleToRadioPacket(meshtastic_MeshPacket &p)
 #if __has_include("modules/DtnOverlayModule.h")
     if (dtnOverlayModule && p.decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP) {
         bool isUnicast = (p.to != NODENUM_BROADCAST && p.to != NODENUM_BROADCAST_NO_LORA);
-        bool shouldIntercept = dtnOverlayModule->shouldInterceptLocalDM(p.to);
+        //fw+ Pass channel (should be 0 here, before encryption)
+        bool shouldIntercept = dtnOverlayModule->shouldInterceptLocalDM(p.to, p.channel);
         LOG_DEBUG("DTN PhoneAPI check: to=0x%x unicast=%d shouldIntercept=%d", 
                   (unsigned)p.to, (int)isUnicast, (int)shouldIntercept);
         if (isUnicast && shouldIntercept) {
-            uint32_t ttlMinutes = dtnOverlayModule->getTtlMinutes();
-            uint64_t deadline = ((uint64_t)getValidTime(RTCQualityFromNet) * 1000ULL) + 
-                               (ttlMinutes * 60ULL * 1000ULL);
+            //fw+ FIX #109: Unified TTL = 6 min for all destinations
+            // PROBLEM: 30min TTL was excessive (15min base + 15min extension)
+            //          Real delivery time for 7 hops ≈ 1.5 min → 6 min gives 4x margin
+            //          Long TTL wastes resources and delays EXPIRED receipts to User
+            // SOLUTION: Single TTL = 6 min for all destinations (simple, effective)
+            // NOTE: baseTtlMin from config still used for foreign capture (default 15min)
+            uint32_t ttlMinutes = 6;  // 6 min for all (1.5min delivery + 4.5min margin)
+            
+            LOG_DEBUG("DTN: Unified TTL for dest 0x%x - ttl=%umin",
+                      (unsigned)p.to, ttlMinutes);
+            
+            //fw+ Pass TTL directly in minutes (no deadline calculation needed)
             dtnOverlayModule->enqueueFromCaptured(p.id,
                                                   nodeDB->getNodeNum(),
                                                   p.to,
                                                   p.channel,
-                                                  deadline,
+                                                  ttlMinutes,
                                                   false,
                                                   p.decoded.payload.bytes,
                                                   p.decoded.payload.size,
@@ -760,6 +873,27 @@ bool PhoneAPI::handleToRadioPacket(meshtastic_MeshPacket &p)
                 router->cancelSending(nodeDB->getNodeNum(), p.id);
                 LOG_DEBUG("DTN: Cancelled Router retransmission for id=0x%x", (unsigned)p.id);
             }
+            
+            //fw+ FIX #102f: Send implicit ACK when DTN intercepts PhoneAPI message
+            // PROBLEM: Android app expects 2 ACKs for DTN delivery:
+            //   1. Implicit ACK (from=self) → MessageStatus.DELIVERED → "Forwarded by other node" ✓
+            //   2. Final ACK (from=dest) → MessageStatus.RECEIVED → "Delivery confirmed" ✓✓
+            // SOLUTION: Send implicit ACK immediately after DTN intercept
+            // NOTE: hopLimit=0 ensures ACK is LOCAL only (guarded by Router.cpp FIX #102d)
+            if (routingModule) {
+                routingModule->sendAckNak(meshtastic_Routing_Error_NONE, nodeDB->getNodeNum(), p.id, p.channel, 0, false);
+                LOG_INFO("DTN: Sent implicit ACK for PhoneAPI intercept id=0x%x (UX: 'Forwarded by other node')",
+                         (unsigned)p.id);
+            }
+            
+            //fw+ FIX #108a: Send DTN ACCEPTED receipt to APK
+            // PROBLEM: APK shows "sent" but user doesn't know DTN accepted custody
+            //          15-20s delay for route discovery → user confused ("did it send?")
+            // SOLUTION: Send PROGRESSED receipt immediately after DTN intercept
+            //           UX: "DTN custody accepted" (loading animation)
+            // NOTE: This informs APK that DTN started processing (not just queued)
+            sendDtnAcceptedReceipt(p.id, p.channel);
+
             
             // Send queue status so phone doesn't show "waiting"
             meshtastic_QueueStatus qs = router->getQueueStatus();

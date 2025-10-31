@@ -94,7 +94,6 @@ bool PacketHistory::wasSeenRecently(const meshtastic_MeshPacket *p, bool withUpd
         LOG_DEBUG("Packet History - Hop limit upgrade: packet 0x%08x from hop_limit=%d to hop_limit=%d", p->id, found->hop_limit,
                   p->hop_limit);
         *wasUpgraded = true;
-        seenRecently = false; // Allow router processing but prevent duplicate app delivery
     } else if (wasUpgraded) {
         *wasUpgraded = false; // Initialize to false if not an upgrade
     }
@@ -458,4 +457,25 @@ inline uint8_t PacketHistory::getOurTxHopLimit(PacketRecord &r)
 inline void PacketHistory::setOurTxHopLimit(PacketRecord &r, uint8_t hopLimit)
 {
     r.hop_limit = (r.hop_limit & ~HOP_LIMIT_OUR_TX_MASK) | ((hopLimit << HOP_LIMIT_OUR_TX_SHIFT) & HOP_LIMIT_OUR_TX_MASK);
+}
+
+//fw+ FIX #21: Clear specific entry by ID (for DTN local delivery to avoid duplicate suppression)
+void PacketHistory::clearEntry(PacketId id)
+{
+    if (!initOk()) {
+        LOG_ERROR("Packet History - clearEntry: NOT INITIALIZED!");
+        return;
+    }
+    
+    if (id == 0) {
+        return; // Invalid ID
+    }
+    
+    // Find and clear all entries with this ID (regardless of sender)
+    for (uint32_t i = 0; i < recentPacketsCapacity; i++) {
+        if (recentPackets[i].id == id) {
+            memset(&recentPackets[i], 0, sizeof(PacketRecord));
+            LOG_DEBUG("Packet History - Cleared entry for id=0x%x (slot=%u)", id, i);
+        }
+    }
 }
