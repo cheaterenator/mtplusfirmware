@@ -515,7 +515,7 @@ void menuHandler::homeBaseMenu()
             }
             saveUIConfig();
 #elif defined(PCA_PIN_EINK_EN)
-            if (uiconfig.screen_brightness == 1) {
+            if (uiconfig.screen_brightness > 0) {
                 uiconfig.screen_brightness = 0;
                 io.digitalWrite(PCA_PIN_EINK_EN, LOW);
             } else {
@@ -936,7 +936,9 @@ void menuHandler::BluetoothToggleMenu()
     bannerOptions.optionsArrayPtr = optionsArray;
     bannerOptions.optionsCount = 3;
     bannerOptions.bannerCallback = [](int selected) -> void {
-        if (selected == 1 || selected == 2) {
+        if (selected == 0)
+            return;
+        else if (selected != (config.bluetooth.enabled ? 1 : 2)) {
             InputEvent event = {.inputEvent = (input_broker_event)170, .kbchar = 170, .touchX = 0, .touchY = 0};
             inputBroker->injectInputEvent(&event);
         }

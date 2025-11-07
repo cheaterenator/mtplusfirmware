@@ -757,6 +757,7 @@ std::vector<std::unique_ptr<meshtastic_OnDemand>> OnDemandModule::createSegmente
             entry.next_hop = e.next_hop;
             entry.cost = e.aggregated_cost;
             entry.confidence = e.confidence;
+            entry.source = meshtastic_RouteSource_ROUTE_SOURCE_DV_ETX;
             uint32_t now = millis();
             entry.age_secs = (now >= e.lastUpdatedMs) ? (now - e.lastUpdatedMs) / 1000 : 0;
 
@@ -778,6 +779,68 @@ std::vector<std::unique_ptr<meshtastic_OnDemand>> OnDemandModule::createSegmente
                 break;
             }
             currentIndex++;
+        }
+
+        packets.push_back(std::move(onDemand));
+        packetIndex++;
+    }
+
+    // Append legacy NodeDB next-hop entries as separate entries flagged as LEGACY
+    // These reflect raw NodeDB.next_hop values for visibility/debugging
+    std::vector<meshtastic_RoutingTableEntry> legacyEntries;
+    int totalNodes = nodeDB->getNumMeshNodes();
+    for (int i = 0; i < totalNodes; ++i) {
+        meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
+        if (!n) continue;
+        if (n->num == nodeDB->getNodeNum()) continue;
+        if (n->next_hop == 0) continue;
+
+        meshtastic_RoutingTableEntry entry = meshtastic_RoutingTableEntry_init_zero;
+        entry.dest = n->num;
+        entry.next_hop = n->next_hop;
+        entry.cost = 0.0f;
+        entry.confidence = 0;
+        entry.age_secs = 0;
+        entry.source = meshtastic_RouteSource_ROUTE_SOURCE_LEGACY;
+        legacyEntries.push_back(entry);
+    }
+
+    int currentLegacy = 0;
+    while (currentLegacy < (int)legacyEntries.size())
+    {
+        std::unique_ptr<meshtastic_OnDemand> onDemand(new meshtastic_OnDemand);
+        *onDemand = meshtastic_OnDemand_init_zero;
+        onDemand->which_variant = meshtastic_OnDemand_response_tag;
+        onDemand->variant.response.response_type = meshtastic_OnDemandType_RESPONSE_ROUTING_TABLE;
+        onDemand->variant.response.which_response_data = meshtastic_OnDemandResponse_routing_table_tag;
+        onDemand->has_packet_index = true;
+        onDemand->has_packet_total = true;
+        onDemand->packet_index = packetIndex;
+
+        meshtastic_RoutingTable &listRef = onDemand->variant.response.response_data.routing_table;
+        listRef.routes_count = 0;
+
+        while (currentLegacy < (int)legacyEntries.size())
+        {
+            const auto &e = legacyEntries[currentLegacy];
+            // capacity guard for nanopb repeated field
+            const size_t cap = sizeof(listRef.routes) / sizeof(listRef.routes[0]);
+            if (listRef.routes_count >= (pb_size_t)cap) {
+                break;
+            }
+            int pos = listRef.routes_count;
+            listRef.routes[pos] = e;
+            listRef.routes_count++;
+
+            if (!fitsInPacket(*onDemand, MAX_PACKET_SIZE))
+            {
+                listRef.routes_count--;
+                if (listRef.routes_count == 0) {
+                    currentLegacy++;
+                }
+                break;
+            }
+            currentLegacy++;
         }
 
         packets.push_back(std::move(onDemand));

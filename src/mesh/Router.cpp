@@ -455,18 +455,10 @@ ErrorCode Router::send(meshtastic_MeshPacket *p)
             bool enqueued = dtnOverlayModule->enqueueFromCaptured(p->id, getFrom(p), p->to, p->channel, ttlMinutes,
                                                                   false, p->decoded.payload.bytes, p->decoded.payload.size, true);
             if (enqueued) {
-                //fw+ FIX #102f: Send implicit ACK when DTN intercepts message (UX: "Forwarded by other node")
-                // PROBLEM: Android app expects 2 ACKs for DTN delivery:
-                //   1. Implicit ACK (from=self) → MessageStatus.DELIVERED → "Forwarded by other node"
-                //   2. Final ACK (from=dest) → MessageStatus.RECEIVED → "Delivery confirmed"
-                // SOLUTION: Send implicit ACK here, DTN will send final ACK when DELIVERED receipt arrives
-                // NOTE: hopLimit=0 ensures ACK is LOCAL only (guarded by FIX #102d)
-                
-                // Send implicit ACK to source app (from=self, so Kotlin shows DELIVERED not RECEIVED)
-                routingModule->sendAckNak(meshtastic_Routing_Error_NONE, getFrom(p), p->id, p->channel, 0, false);
-                LOG_INFO("DTN: Sent implicit ACK for intercepted message id=0x%x (UX: 'Forwarded by other node')",
-                         (unsigned)p->id);
-                
+                // Disable synthetic local implicit ACK to avoid UI confusion; rely on DTN receipts (ACCEPTED/TRANSMITTED/DELIVERED)
+                // Cancel any Router retransmission for this packet ID (we took DTN custody)
+                cancelSending(getFrom(p), p->id);
+                LOG_DEBUG("DTN: Intercepted id=0x%x - cancelled Router retransmission, no local implicit ACK", (unsigned)p->id);
                 packetPool.release(p);
                 return meshtastic_Routing_Error_NONE;
             }
@@ -629,6 +621,11 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
                     LOG_ERROR("Invalid protobufs in received mesh packet id=0x%08x (bad psk?)!", p->id);
                 } else if (decodedtmp.portnum == meshtastic_PortNum_UNKNOWN_APP) {
                     LOG_ERROR("Invalid portnum (bad psk?)!");
+#if !(MESHTASTIC_EXCLUDE_PKI)
+                } else if (!owner.is_licensed && isToUs(p) && decodedtmp.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP) {
+                    LOG_WARN("Rejecting legacy DM");
+                    return DecodeState::DECODE_FAILURE;
+#endif
                 } else {
                     p->decoded = decodedtmp;
                     p->which_payload_variant = meshtastic_MeshPacket_decoded_tag; // change type to decoded
@@ -760,7 +757,9 @@ meshtastic_Routing_Error perhapsEncode(meshtastic_MeshPacket *p)
             (node->user.public_key.size == 32) &&
             // Some portnums either make no sense to send with PKC
             p->decoded.portnum != meshtastic_PortNum_TRACEROUTE_APP && p->decoded.portnum != meshtastic_PortNum_NODEINFO_APP &&
-            p->decoded.portnum != meshtastic_PortNum_ROUTING_APP && p->decoded.portnum != meshtastic_PortNum_POSITION_APP) {
+            p->decoded.portnum != meshtastic_PortNum_ROUTING_APP && p->decoded.portnum != meshtastic_PortNum_POSITION_APP &&
+            //fw+ DTN custody/receipts must remain PSK-encrypted so intermediates can decode custody_path
+            p->decoded.portnum != meshtastic_PortNum_FWPLUS_DTN_APP) {
             LOG_DEBUG("Use PKI!");
             if (numbytes + MESHTASTIC_HEADER_LENGTH + MESHTASTIC_PKC_OVERHEAD > MAX_LORA_PAYLOAD_LEN)
                 return meshtastic_Routing_Error_TOO_LARGE;

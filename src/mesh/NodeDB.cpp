@@ -24,6 +24,7 @@
 #include "modules/NeighborInfoModule.h"
 #include <ErriezCRC32.h>
 #include <algorithm>
+#include <cstdlib>
 #include <pb_decode.h>
 #include <pb_encode.h>
 #include <vector>
@@ -269,6 +270,18 @@ NodeDB::NodeDB()
         config.security.serial_enabled = config.device.serial_enabled;
         config.security.is_managed = config.device.is_managed;
     }
+
+#ifdef ARCH_PORTDUINO
+    //fw+ Force simulator PKI test runs to use US region when DTN_PRESERVE_REGION=1
+    if (!owner.is_licensed) {
+        if (const char *preserveRegionEnv = getenv("DTN_PRESERVE_REGION")) {
+            if (atoi(preserveRegionEnv) != 0 && config.lora.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET) {
+                LOG_WARN("PKI: Overriding UNSET region with US for portduino PKI tests");
+                config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+            }
+        }
+    }
+#endif
 
 #if !(MESHTASTIC_EXCLUDE_PKI_KEYGEN || MESHTASTIC_EXCLUDE_PKI)
 
@@ -933,7 +946,7 @@ void NodeDB::installDefaultModuleConfig()
 
     //fw+ removed HEARD/RAB defaults
     // Routing learning thresholds defaults (FW+)
-    moduleConfig.nodemodadmin.min_confidence_to_use = 1; // start using after first good observation
+    moduleConfig.nodemodadmin.min_confidence_to_use = 0; // start using after first good observation
     moduleConfig.nodemodadmin.hysteresis_cost_threshold_tenths = 5; // 0.5 cost units
 
     moduleConfig.has_neighbor_info = true;
@@ -945,32 +958,28 @@ void NodeDB::installDefaultModuleConfig()
     moduleConfig.detection_sensor.detection_trigger_type = meshtastic_ModuleConfig_DetectionSensorConfig_TriggerType_LOGIC_HIGH;
     moduleConfig.detection_sensor.minimum_broadcast_secs = 45;
 
-    //fw+ DTN overlay defaults (ensure APK sees post-install defaults)
-    // Synchronized with DtnOverlayModule.cpp fallback values for consistency
+    //fw+ DTN overlay defaults 
     moduleConfig.has_dtn_overlay = true;
     moduleConfig.dtn_overlay.enabled = false; //fw+ default OFF for safe testing
 #if ARCH_PORTDUINO
-    //fw+ For native/Portduino simulator builds, force-enable DTN overlay by default for testing
     moduleConfig.dtn_overlay.enabled = true;
 #endif
 
-    moduleConfig.dtn_overlay.ttl_minutes = 10;        // 10 minutes - realistic for multi-hop custody
-    moduleConfig.dtn_overlay.initial_delay_base_ms = 2000; // 2s - faster first attempt
-    //Fast custody chain forwarding (was 120000ms = 2min causing deadlocks)
-    moduleConfig.dtn_overlay.retry_backoff_ms = 5000;    // 5s - enables fluid multi-hop DTN delivery
-    moduleConfig.dtn_overlay.max_tries = 3;
+    moduleConfig.dtn_overlay.ttl_minutes = 5; // DTN custody TTL
+    moduleConfig.dtn_overlay.initial_delay_base_ms = 8000; 
+    moduleConfig.dtn_overlay.retry_backoff_ms = 40000;   
+    moduleConfig.dtn_overlay.max_tries = 2;
     moduleConfig.dtn_overlay.late_fallback_enabled = false;
     moduleConfig.dtn_overlay.fallback_tail_percent = 20;
-    //fw+ milestones default ON for development/testing; disable for production builds
+   
     #ifdef ARCH_PORTDUINO
-    moduleConfig.dtn_overlay.milestones_enabled = true;  // ON for simulator testing (implicit ACK for custody chain)
+        moduleConfig.dtn_overlay.milestones_enabled = true;
     #else
-    moduleConfig.dtn_overlay.milestones_enabled = false; // OFF for Arduino/T-Beam (save airtime)
+        moduleConfig.dtn_overlay.milestones_enabled = true; 
     #endif
-    // Reduce per-dest spacing for concurrent custody transfers (was 60000ms = 1min)
-    moduleConfig.dtn_overlay.per_dest_min_spacing_ms = 10000; // 10s - allows multiple custody packets in flight
-    // CIncrease concurrent custody transfers for network throughput (was 1 = severe bottleneck)
-    moduleConfig.dtn_overlay.max_active_dm = 3; // allows multiple concurrent custody chains
+
+    moduleConfig.dtn_overlay.per_dest_min_spacing_ms = 30000;
+    moduleConfig.dtn_overlay.max_active_dm = 1; // allows multiple concurrent custody chains
     moduleConfig.dtn_overlay.probe_fwplus_near_deadline = false;
 
     // fw+ Broadcast Assist defaults
@@ -1085,12 +1094,25 @@ void NodeDB::installDefaultChannels()
     channelFile.version = DEVICESTATE_CUR_VER;
 }
 
-void NodeDB::resetNodes()
+void NodeDB::resetNodes(bool keepFavorites)
 {
     if (!config.position.fixed_position)
         clearLocalPosition();
     numMeshNodes = 1;
-    std::fill(nodeDatabase.nodes.begin() + 1, nodeDatabase.nodes.end(), meshtastic_NodeInfoLite());
+    if (keepFavorites) {
+        LOG_INFO("Clearing node database - preserving favorites");
+        for (size_t i = 0; i < meshNodes->size(); i++) {
+            meshtastic_NodeInfoLite &node = meshNodes->at(i);
+            if (i > 0 && !node.is_favorite) {
+                node = meshtastic_NodeInfoLite();
+            } else {
+                numMeshNodes += 1;
+            }
+        };
+    } else {
+        LOG_INFO("Clearing node database - removing favorites");
+        std::fill(nodeDatabase.nodes.begin() + 1, nodeDatabase.nodes.end(), meshtastic_NodeInfoLite());
+    }
     devicestate.has_rx_text_message = false;
     devicestate.has_rx_waypoint = false;
     saveNodeDatabaseToDisk();
@@ -1417,12 +1439,12 @@ void NodeDB::loadFromDisk()
         bool mutated = false;
         moduleConfig.has_dtn_overlay = true; // ensure section is marked present
         auto &dtn = moduleConfig.dtn_overlay;
-        if (dtn.ttl_minutes == 0) { dtn.ttl_minutes = 15; mutated = true; }
-        if (dtn.initial_delay_base_ms == 0) { dtn.initial_delay_base_ms = 8000; mutated = true; }
-        if (dtn.retry_backoff_ms == 0) { dtn.retry_backoff_ms = 5000; mutated = true; }
+        if (dtn.ttl_minutes == 0) { dtn.ttl_minutes = 8; mutated = true; }
+        if (dtn.initial_delay_base_ms == 0) { dtn.initial_delay_base_ms = 2000; mutated = true; }
+        if (dtn.retry_backoff_ms == 0) { dtn.retry_backoff_ms = 30000; mutated = true; }
         if (dtn.max_tries == 0) { dtn.max_tries = 3; mutated = true; }
         if (dtn.fallback_tail_percent == 0) { dtn.fallback_tail_percent = 20; mutated = true; }
-        if (dtn.per_dest_min_spacing_ms == 0) { dtn.per_dest_min_spacing_ms = 10000; mutated = true; }
+        if (dtn.per_dest_min_spacing_ms == 0) { dtn.per_dest_min_spacing_ms = 30000; mutated = true; }
         if (dtn.max_active_dm == 0) { dtn.max_active_dm = 3; mutated = true; }
         // Booleans: do not force-enable module by default; respect existing setting
         // If field is absent/zero on upgrade, keep default OFF for safety; enable only by user action
@@ -1906,13 +1928,32 @@ void NodeDB::addFromContact(meshtastic_SharedContact contact)
         // If should_ignore is set,
         // we need to clear the public key and other cruft, in addition to setting the node as ignored
         info->is_ignored = true;
+        info->is_favorite = false;
         info->has_device_metrics = false;
         info->has_position = false;
         info->user.public_key.size = 0;
         info->user.public_key.bytes[0] = 0;
     } else {
-        info->last_heard = getValidTime(RTCQualityNTP);
-        info->is_favorite = true;
+        /* Clients are sending add_contact before every text message DM (because clients may hold a larger node database with
+         * public keys than the radio holds). However, we don't want to update last_heard just because we sent someone a DM!
+         */
+
+        /* "Boring old nodes" are the first to be evicted out of the node database when full. This includes a newly-zeroed
+         * nodeinfo because it has: !is_favorite && last_heard==0. To keep this from happening when we addFromContact, we set the
+         * new node as a favorite, and we leave last_heard alone (even if it's zero).
+         */
+        if (config.device.role == meshtastic_Config_DeviceConfig_Role_CLIENT_BASE) {
+            // Special case for CLIENT_BASE: is_favorite has special meaning, and we don't want to automatically set it
+            // without the user doing so deliberately. We don't normally expect users to use a CLIENT_BASE to send DMs or to add
+            // contacts, but we should make sure it doesn't auto-favorite in case they do. Instead, as a workaround, we'll set
+            // last_heard to now, so that the add_contact node doesn't immediately get evicted.
+            info->last_heard = getTime();
+        } else {
+            // Normal case: set is_favorite to prevent expiration.
+            // last_heard will remain as-is (or remain 0 if this entry wasn't in the nodeDB).
+            info->is_favorite = true;
+        }
+
         // As the clients will begin sending the contact with DMs, we want to strictly check if the node is manually verified
         if (contact.manually_verified) {
             info->bitfield |= NODEINFO_BITFIELD_IS_KEY_MANUALLY_VERIFIED_MASK;
